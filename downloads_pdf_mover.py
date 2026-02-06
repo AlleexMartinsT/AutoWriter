@@ -16,6 +16,7 @@ from datetime import datetime
 import ctypes
 import urllib.request
 import urllib.error
+import ssl
 import tempfile
 from pathlib import Path
 
@@ -27,7 +28,8 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
+GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -44,7 +46,6 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "boleto_destino_horizonte": r"\\192.168.1.240\eh\CAIXA PDF-XML-BOLETOS ELE. HORIZONTE\BOLETOS 2026",
         "email_enabled": "0",
         "debug_enabled": "0",
-        "github_repo": "",
         "auto_update_enabled": "1",
     }
 
@@ -71,6 +72,10 @@ def _report_path(base_dir: Path) -> Path:
 def _report_state_path(base_dir: Path) -> Path:
     appdata = Path(os.getenv("APPDATA", str(base_dir)))
     return Path(os.getenv("PDF_REPORT_STATE_PATH", str(appdata / "PdfWatcher" / "report_state.json")))
+
+def _viewer_settings_path(base_dir: Path) -> Path:
+    appdata = Path(os.getenv("APPDATA", str(base_dir)))
+    return Path(os.getenv("PDF_VIEWER_SETTINGS_PATH", str(appdata / "PdfWatcher" / "viewer_settings.json")))
 
 
 def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
@@ -155,6 +160,37 @@ def _salvar_report_state(base_dir: Path, state: dict[str, str], log=print) -> No
         path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         log(f"Falha ao salvar estado de relatório '{path}': {e}")
+
+
+def _carregar_viewer_settings(base_dir: Path, log=print) -> dict[str, bool]:
+    path = _viewer_settings_path(base_dir)
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {
+                    "show_dates": bool(raw.get("show_dates", True)),
+                    "show_time": bool(raw.get("show_time", False)),
+                    "auto_scroll": bool(raw.get("auto_scroll", False)),
+                    "pause_refresh": bool(raw.get("pause_refresh", False)),
+                }
+        except Exception as e:
+            log(f"Falha ao ler configuracoes do visualizador '{path}': {e}")
+    return {
+        "show_dates": True,
+        "show_time": False,
+        "auto_scroll": False,
+        "pause_refresh": False,
+    }
+
+
+def _salvar_viewer_settings(base_dir: Path, settings: dict[str, bool], log=print) -> None:
+    path = _viewer_settings_path(base_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"Falha ao salvar configuracoes do visualizador '{path}': {e}")
 
 
 def _registrar_relatorio(base_dir: Path, nf: str, status: str, motivo: str, log=print) -> None:
@@ -1361,7 +1397,6 @@ def _abrir_interface_config(base_dir: Path, log=print):
         ("Destino XML HORIZONTE", "xml_destino_horizonte"),
         ("Destino BOLETO MVA", "boleto_destino_mva"),
         ("Destino BOLETO HORIZONTE", "boleto_destino_horizonte"),
-        ("GitHub repo (usuario/repositorio)", "github_repo"),
     ]
 
     app = QApplication.instance()
@@ -1433,8 +1468,6 @@ def _abrir_interface_config(base_dir: Path, log=print):
         btn = QPushButton("Selecionar")
         btn.setProperty("class", "pick")
         btn.clicked.connect(lambda _=False, c=chave: selecionar_pasta(c))
-        if chave == "github_repo":
-            btn.setEnabled(False)
         edits[chave] = edit
         grid.addWidget(lbl, i, 0)
         grid.addWidget(edit, i, 1)
@@ -1532,6 +1565,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
 
     caminho_log = _log_path(base_dir)
     caminho_debug = _debug_log_path(base_dir)
+    viewer_settings = _carregar_viewer_settings(base_dir, log=log)
     app = QApplication.instance()
     created_app = False
     if app is None:
@@ -1593,13 +1627,13 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     settings_layout = QVBoxLayout(settings_tab)
     settings_layout.setContentsMargins(14, 10, 14, 10)
     chk_show_dates = QCheckBox("Mostrar datas nos logs")
-    chk_show_dates.setChecked(True)
+    chk_show_dates.setChecked(viewer_settings.get("show_dates", True))
     chk_show_time = QCheckBox("Mostrar hora nos logs")
-    chk_show_time.setChecked(False)
+    chk_show_time.setChecked(viewer_settings.get("show_time", False))
     chk_auto_scroll = QCheckBox("Auto‑rolar para o final")
-    chk_auto_scroll.setChecked(False)
+    chk_auto_scroll.setChecked(viewer_settings.get("auto_scroll", False))
     chk_pause_refresh = QCheckBox("Pausar atualização automática")
-    chk_pause_refresh.setChecked(False)
+    chk_pause_refresh.setChecked(viewer_settings.get("pause_refresh", False))
     chk_show_dates.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     chk_show_time.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     chk_auto_scroll.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
@@ -1728,14 +1762,26 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             log(f"Falha ao limpar log: {e}")
         carregar_ativos()
 
+    def salvar_viewer():
+        _salvar_viewer_settings(
+            base_dir,
+            {
+                "show_dates": chk_show_dates.isChecked(),
+                "show_time": chk_show_time.isChecked(),
+                "auto_scroll": chk_auto_scroll.isChecked(),
+                "pause_refresh": chk_pause_refresh.isChecked(),
+            },
+            log=log,
+        )
+
     btn_refresh.clicked.connect(carregar_ativos)
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
-    chk_show_dates.stateChanged.connect(lambda *_: carregar_ativos())
-    chk_show_time.stateChanged.connect(lambda *_: carregar_ativos())
-    chk_auto_scroll.stateChanged.connect(lambda *_: carregar_ativos())
-    chk_pause_refresh.stateChanged.connect(lambda *_: atualizar_timer())
+    chk_show_dates.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
+    chk_show_time.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
+    chk_auto_scroll.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
+    chk_pause_refresh.stateChanged.connect(lambda *_: (salvar_viewer(), atualizar_timer()))
     btn_clear.clicked.connect(limpar_log)
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     carregar_ativos()
@@ -1914,24 +1960,19 @@ def _parse_version(tag: str) -> tuple[int, int, int]:
 
 
 def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> bool:
-    cfg = _carregar_config(base_dir, log=log)
-    repo = (cfg.get("github_repo") or "").strip()
-    if not repo:
-        log("GitHub repo não configurado. Defina em Configuração.")
-        try:
-            from PySide6.QtWidgets import QMessageBox, QApplication
-            app = QApplication.instance() or QApplication(sys.argv)
-            QMessageBox.information(None, "Atualização", "Configure o GitHub repo (usuario/repositorio) na tela de Configuração.")
-        except Exception:
-            pass
-        return False
+    repo = GITHUB_REPO
     if not getattr(sys, "frozen", False):
         log("Atualização automática só funciona no executável (modo frozen).")
         return False
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "PdfWatcher"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         log(f"Falha ao verificar atualização: {e}")
@@ -1976,7 +2017,13 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
     try:
         temp_dir = Path(tempfile.gettempdir())
         destino = temp_dir / exe_name
-        urllib.request.urlretrieve(exe_url, destino)
+        try:
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            with urllib.request.urlopen(exe_url, context=ctx) as r, open(destino, "wb") as f:
+                f.write(r.read())
+        except Exception:
+            urllib.request.urlretrieve(exe_url, destino)
         log(f"Atualização baixada: {destino}")
 
         exe_atual = Path(sys.executable)

@@ -27,6 +27,7 @@ client_secret_*.json
 token.json
 config.json
 *.pdf
+PdfWatcher/
 
 # OS
 Thumbs.db

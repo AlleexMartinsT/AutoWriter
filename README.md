@@ -64,9 +64,8 @@ Expected output: `dist/PdfWatcher.exe`
 
 ## Auto update (GitHub Releases)
 
-1. Set the repo in Config (e.g. `AlleexMartinsT/AutoWriter`).
-2. Publish a GitHub Release with a `.exe` asset.
-3. The app will prompt to update, download the new EXE, replace the current one, and restart.
+1. Publish a GitHub Release with a `.exe` asset.
+2. The app will prompt to update, download the new EXE, replace the current one, and restart.
 
 ## Optional environment variables
 
