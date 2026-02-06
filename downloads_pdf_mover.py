@@ -27,7 +27,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -499,7 +499,11 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
     pagador_norm = _normalizar_nome_arquivo(pagador).upper()
     palavras = re.findall(r"[A-Z0-9]+", pagador_norm)
     pagador_curto = " ".join(palavras[:2]).strip() if palavras else pagador_norm
-    final_nosso = nosso_num[-4:] if len(nosso_num) >= 4 else nosso_num
+    final_nosso = nosso_num
+    if final_nosso:
+        # Mantém o formato completo em boletos com hífen (ex.: 7239-1).
+        if "-" not in final_nosso or len(final_nosso) > 10:
+            final_nosso = final_nosso[-4:] if len(final_nosso) >= 4 else final_nosso
     sufixo = f" BLT {final_nosso}" if final_nosso else ""
     return f"BOLETO NF{nf} {pagador_curto}{sufixo}.pdf"
 
