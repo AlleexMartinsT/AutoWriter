@@ -125,7 +125,7 @@ def _salvar_config(base_dir: Path, cfg: dict[str, str]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def _log(msg: str, log_path: Path):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts = datetime.now().strftime("%d-%m-%Y")
     linha = f"[{ts}] {msg}"
     print(linha)
     try:
@@ -144,7 +144,7 @@ def _carregar_report_state(base_dir: Path, log=print) -> dict[str, str]:
             if isinstance(raw, dict):
                 return {str(k): str(v) for k, v in raw.items()}
         except Exception as e:
-            log(f"Falha ao ler estado de relatorio '{path}': {e}")
+            log(f"Falha ao ler estado de relatório '{path}': {e}")
     return {}
 
 
@@ -154,19 +154,19 @@ def _salvar_report_state(base_dir: Path, state: dict[str, str], log=print) -> No
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        log(f"Falha ao salvar estado de relatorio '{path}': {e}")
+        log(f"Falha ao salvar estado de relatório '{path}': {e}")
 
 
 def _registrar_relatorio(base_dir: Path, nf: str, status: str, motivo: str, log=print) -> None:
     path = _report_path(base_dir)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    linha = f"[{ts}] NF{nf} | {status} | {motivo}"
+    ts = datetime.now().strftime("%d-%m-%Y")
+    linha = f"[{ts}] NF{nf} | {status} | Motivo: {motivo}"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as f:
             f.write(linha + "\n")
     except Exception as e:
-        log(f"Falha ao gravar relatorio: {e}")
+        log(f"Falha ao gravar relatório: {e}")
 
 
 def criar_pasta_data(base_dir: Path) -> Path:
@@ -241,7 +241,7 @@ def mover_pdf(origem: Path, destino_dir: Path, log=print, novo_nome: str | None 
     destino = destino_dir / (novo_nome or origem.name)
 
     if destino.exists():
-        log(f"Arquivo ja existe no destino, ignorado: {destino}")
+        log(f"Arquivo já existe no destino, ignorado: {destino}")
         return None
 
     try:
@@ -328,21 +328,149 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
         if m_nrdoc:
             nf = m_nrdoc.group(1).lstrip("0") or m_nrdoc.group(1)
     if not nf:
+        m_ref = re.search(r"REFERENTE\s+A\s+NF\s*0*([0-9]{1,12})\b", texto, re.IGNORECASE)
+        if m_ref:
+            nf = m_ref.group(1).lstrip("0") or m_ref.group(1)
+    if not nf:
         nf = _extrair_nf_do_nome(caminho.name)
 
-    m_pagador = re.search(r"Pagador\s*\n\s*([^\n]+)", texto, re.IGNORECASE)
-    pagador = m_pagador.group(1).strip() if m_pagador else None
+    def _extrair_pagador(txt: str) -> str | None:
+        linhas = [ln.strip() for ln in txt.splitlines()]
+        cnpj_re = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+        blacklist = {
+            "DADOS DO PAGADOR",
+            "DADOS DO PAGADOR/AVALISTA",
+            "DADOS DO PAGADOR / AVALISTA",
+            "DADOS DO SACADO",
+            "PAGADOR",
+            "PAGADOR/AVALISTA",
+            "AVALISTA",
+            "SACADO",
+            "NOME DO PAGADOR NUMERO DO DOCUMENTO",
+            "ENDERECO",
+            "ENDEREÇO",
+            "MUNICIPIO UF CEP",
+            "MUNICÍPIO UF CEP",
+            "MENSAGEM PAGADOR",
+        }
+        # 1) Preferir linha com CNPJ (normalmente vem com o nome do pagador)
+        for ln in linhas:
+            if not ln:
+                continue
+            if cnpj_re.search(ln):
+                if re.search(r"benefici[aá]rio|cedente|sacador|avalista", ln, re.IGNORECASE):
+                    continue
+                nome = cnpj_re.split(ln)[0].strip()
+                if nome and nome.upper() not in blacklist:
+                    return nome
+        # 2) Fallback: procurar região de "Pagador"
+        for i, ln in enumerate(linhas):
+            if not ln:
+                continue
+            if re.search(r"\bPAGADOR\b", ln, re.IGNORECASE):
+                m = re.search(r"PAGADOR\\s*[:\\-]\\s*(.+)$", ln, re.IGNORECASE)
+                if m:
+                    nome = m.group(1).strip()
+                    if nome and nome.upper() not in blacklist:
+                        return nome
+                for j in range(i + 1, min(i + 8, len(linhas))):
+                    cand = linhas[j].strip()
+                    if not cand:
+                        continue
+                    if cand.upper() in blacklist:
+                        continue
+                    return cand
+        return None
+
+    def _extrair_beneficiario(txt: str) -> str | None:
+        linhas = [ln.strip() for ln in txt.splitlines()]
+        texto_mva = os.getenv("BOLETO_TEXT_MATCH_MVA", "MVA").strip()
+        texto_horizonte = os.getenv("BOLETO_TEXT_MATCH_HORIZONTE", "HORIZONTE").strip()
+        # 1) Prioriza linhas que contenham o nome esperado (MVA/HORIZONTE)
+        for ln in linhas:
+            if not ln:
+                continue
+            if texto_mva and texto_mva.lower() in ln.lower():
+                return ln
+            if texto_horizonte and texto_horizonte.lower() in ln.lower():
+                return ln
+
+        blacklist = {
+            "LOCAL DE PAGAMENTO",
+            "DATA DO DOCUMENTO",
+            "USO DO BANCO",
+            "INSTRUÇÕES (TEXTO DE RESPONSABILIDADE DO BENEFICIÁRIO)",
+            "PAGADOR",
+            "BENEFICIÁRIO FINAL",
+            "FICHA DE COMPENSAÇÃO",
+            "VENCIMENTO",
+            "NOSSO NÚMERO",
+            "VALOR DOCUMENTO",
+        }
+        cand = None
+        for i, ln in enumerate(linhas):
+            if re.search(r"\bbenefici[aá]rio\b", ln, re.IGNORECASE) and ln.strip().lower() in {"beneficiario", "beneficiário"}:
+                for j in range(i + 1, min(i + 6, len(linhas))):
+                    v = linhas[j].strip()
+                    if not v:
+                        continue
+                    if v.upper() in blacklist:
+                        continue
+                    if re.search(r"benefici[aá]rio", v, re.IGNORECASE):
+                        continue
+                    cand = v
+                if cand:
+                    return cand
+        return None
+
+    pagador = _extrair_pagador(texto)
     if pagador:
         pagador = pagador.split(" - CNPJ", 1)[0].strip()
         pagador = _normalizar_nome_arquivo(pagador)
+    if not pagador:
+        linhas = [ln.strip() for ln in texto.splitlines()]
+        cnpj_re = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+        for ln in linhas:
+            if not ln:
+                continue
+            if cnpj_re.search(ln):
+                if re.search(r"benefici[aá]rio|cedente|sacador|avalista", ln, re.IGNORECASE):
+                    continue
+                nome = cnpj_re.split(ln)[0].strip()
+                if nome:
+                    pagador = _normalizar_nome_arquivo(nome)
+                    break
 
     m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,120}?([0-9]{6,})", texto, re.IGNORECASE)
     nosso_numero = m_nosso.group(1) if m_nosso else None
+    if not nosso_numero:
+        linhas = [ln.strip() for ln in texto.splitlines()]
+        for i, ln in enumerate(linhas):
+            if re.search(r"Nosso\s*n[uú]mero", ln, re.IGNORECASE):
+                janela = " ".join(linhas[i:i+5])
+                m_alt = re.search(r"\b(\d{4,}-?\d{0,2})\b", janela)
+                if m_alt:
+                    nosso_numero = m_alt.group(1)
+                break
+    if not nosso_numero:
+        linhas = [ln.strip() for ln in texto.splitlines()]
+        for ln in linhas:
+            if nf and nf in ln and re.search(r"\bDM\b|\bN\b", ln):
+                m_alt = re.search(r"\b(\d{4,}-\d)\b", ln)
+                if m_alt:
+                    nosso_numero = m_alt.group(1)
+                    break
+    if not nosso_numero:
+        m_alt = re.findall(r"\b(\d{4,}-\d)\b", texto)
+        if m_alt:
+            nosso_numero = m_alt[-1]
 
-    m_benef = re.search(r"Benefici[aá]rio.*?\n\s*([^\n]+)", texto, re.IGNORECASE | re.DOTALL)
-    beneficiario = m_benef.group(1).strip() if m_benef else None
+    beneficiario = _extrair_beneficiario(texto)
     if beneficiario:
         beneficiario = _normalizar_nome_arquivo(beneficiario)
+        beneficiario = re.sub(r"\s+\d{2}/\d{2}/\d{4}.*$", "", beneficiario)
+        beneficiario = re.sub(r"\s+\d{8}.*$", "", beneficiario)
+        beneficiario = re.sub(r"\s+R\$\s*[\d\.,]+.*$", "", beneficiario)
 
     m_benef_cnpj = re.search(
         r"CPF/CNPJ Benefici[aá]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
@@ -412,7 +540,7 @@ def _extrair_dados_nf(texto: str) -> tuple[str | None, str | None]:
 def _montar_nome_pdf(texto_pdf: str, log=print) -> str | None:
     nf_num, razao = _extrair_dados_nf(texto_pdf)
     if not nf_num or not razao:
-        log("Nao foi possivel extrair NF ou razao social para renomear.")
+        log("Não foi possível extrair NF ou razão social para renomear.")
         return None
     return f"PDF NF{nf_num} {razao}.pdf"
 
@@ -776,12 +904,12 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
     movidos_info = []
     if not downloads_dir.exists():
         if debug_log:
-            debug_log(f"[XML] Diretorio nao encontrado: {downloads_dir}")
+            debug_log(f"[XML] Diretório não encontrado: {downloads_dir}")
         return movidos_info
     try:
         itens = list(downloads_dir.iterdir())
     except Exception as e:
-        log(f"Erro lendo diretorio '{downloads_dir}': {e}")
+        log(f"Erro lendo diretório '{downloads_dir}': {e}")
         return movidos_info
     if debug_log:
         debug_log(f"[XML] Total itens na pasta: {len(itens)}")
@@ -841,12 +969,12 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
 def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Path, nome_arquivo: str, padrao_regex: str, texto_mva: str, texto_horizonte: str, cache: dict, log=print, debug_log=None) -> list[dict]:
     movidos_info = []
     if not downloads_dir.exists():
-        log(f"Diretorio nao encontrado: {downloads_dir}")
+        log(f"Diretório não encontrado: {downloads_dir}")
         return movidos_info
     try:
         nomes = os.listdir(downloads_dir)
     except Exception as e:
-        log(f"Erro lendo diretorio '{downloads_dir}': {e}")
+        log(f"Erro lendo diretório '{downloads_dir}': {e}")
         return movidos_info
     if debug_log:
         debug_log(f"[PDF] Total arquivos na pasta: {len(nomes)}")
@@ -945,12 +1073,12 @@ def processar_boletos(
 ) -> list[dict]:
     movidos_info = []
     if not downloads_dir.exists():
-        log(f"Diretorio nao encontrado: {downloads_dir}")
+        log(f"Diretório não encontrado: {downloads_dir}")
         return movidos_info
     try:
         nomes = os.listdir(downloads_dir)
     except Exception as e:
-        log(f"Erro lendo diretorio '{downloads_dir}': {e}")
+        log(f"Erro lendo diretório '{downloads_dir}': {e}")
         return movidos_info
 
     candidatos = [n for n in nomes if _eh_boleto_valido(n)]
@@ -1058,8 +1186,8 @@ def _tentar_criar_rascunhos(
     for nf, bucket in prontas.items():
         if _nf_enviada_gmail(service, nf, log=log):
             nfs_enviadas.add(nf)
-            status = "NAO_RASCUNHO"
-            motivo = "Encontrado em enviados"
+            status = "JÁ ENVIADO"
+            motivo = "E-mail já enviado"
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
                 report_state[nf] = f"{status}|{motivo}"
@@ -1072,7 +1200,7 @@ def _tentar_criar_rascunhos(
 
     if nao_enviadas:
         resumo = ", ".join([f"NF {nf} - {_cliente_por_bucket(bucket)}" for nf, bucket in nao_enviadas])
-        log(f"Os seguintes emails nao foram enviados: {resumo}")
+        log(f"Os seguintes e-mails não foram enviados: {resumo}")
 
     for nf, bucket in nao_enviadas:
         assunto = f"XML PDF NF{nf} + BOLETO"
@@ -1083,13 +1211,13 @@ def _tentar_criar_rascunhos(
             nfs_rascunho.add(nf)
             _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
             log(f"Rascunho criado para NF{nf} (id={draft_id}).")
-            status = "RASCUNHO"
-            motivo = "Rascunho criado"
+            status = "RASCUNHO CRIADO"
+            motivo = "Rascunho criado com sucesso"
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
                 report_state[nf] = f"{status}|{motivo}"
         else:
-            status = "FALHA_RASCUNHO"
+            status = "FALHA AO CRIAR RASCUNHO"
             motivo = "Falha ao criar rascunho"
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
@@ -1215,7 +1343,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
         )
         from PySide6.QtCore import Qt
     except Exception as e:
-        log(f"PySide6 nao encontrado para abrir Configuração: {e}")
+        log(f"PySide6 não encontrado para abrir Configuração: {e}")
         return
 
     cfg = _carregar_config(base_dir, log=log)
@@ -1290,7 +1418,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
 
     def selecionar_pasta(chave: str):
         atual = edits[chave].text().strip() or str(Path.home())
-        selecionado = QFileDialog.getExistingDirectory(dialog, "Selecione o diretorio", atual)
+        selecionado = QFileDialog.getExistingDirectory(dialog, "Selecione o diretório", atual)
         if selecionado:
             edits[chave].setText(selecionado)
 
@@ -1343,7 +1471,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
         novo_cfg["auto_update_enabled"] = "1" if chk_update.isChecked() else "0"
         faltantes = [k for k, v in novo_cfg.items() if not v]
         if faltantes:
-            QMessageBox.warning(dialog, "Configuração", "Preencha todos os diretorios antes de salvar.")
+            QMessageBox.warning(dialog, "Configuração", "Preencha todos os diretórios antes de salvar.")
             return
         try:
             _salvar_config(base_dir, novo_cfg)
@@ -1389,11 +1517,13 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             QPushButton,
             QTextEdit,
             QTabWidget,
+            QWidget,
+            QCheckBox,
         )
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QTextCursor
     except Exception as e:
-        log(f"PySide6 nao encontrado para abrir logs: {e}")
+        log(f"PySide6 não encontrado para abrir logs: {e}")
         return
 
     caminho_log = _log_path(base_dir)
@@ -1437,7 +1567,12 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
 
     title = QLabel("Visualizador de Logs")
     title.setObjectName("title")
-    subtitle = QLabel(f"Log principal: {caminho_log}\nLog debug: {caminho_debug}")
+    subtitle = QLabel(
+        "Aqui você encontra o histórico do programa.\n"
+        "Se você rolar para cima, o log não vai descer sozinho.\n"
+        f"Log principal: {caminho_log}\n"
+        f"Log técnico: {caminho_debug}"
+    )
     subtitle.setObjectName("subtitle")
     layout.addWidget(title)
     layout.addWidget(subtitle)
@@ -1448,7 +1583,29 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     text_debug = QTextEdit()
     text_debug.setReadOnly(True)
     tabs.addTab(text_main, "Log principal")
-    tabs.addTab(text_debug, "Debug tecnico")
+    tabs.addTab(text_debug, "Log técnico (detalhado)")
+
+    # Aba de configurações do visualizador
+    settings_tab = QWidget()
+    settings_layout = QVBoxLayout(settings_tab)
+    settings_layout.setContentsMargins(14, 10, 14, 10)
+    chk_show_dates = QCheckBox("Mostrar datas nos logs")
+    chk_show_dates.setChecked(True)
+    chk_auto_scroll = QCheckBox("Auto‑rolar para o final")
+    chk_auto_scroll.setChecked(False)
+    chk_pause_refresh = QCheckBox("Pausar atualização automática")
+    chk_pause_refresh.setChecked(False)
+    chk_show_dates.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
+    chk_auto_scroll.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
+    chk_pause_refresh.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
+    btn_clear = QPushButton("Limpar log selecionado")
+    btn_clear.setProperty("class", "secondary")
+    settings_layout.addWidget(chk_show_dates)
+    settings_layout.addWidget(chk_auto_scroll)
+    settings_layout.addWidget(chk_pause_refresh)
+    settings_layout.addWidget(btn_clear)
+    settings_layout.addStretch(1)
+    tabs.addTab(settings_tab, "⚙ Configurações")
     layout.addWidget(tabs, 1)
 
     actions = QHBoxLayout()
@@ -1465,16 +1622,31 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     actions.addWidget(btn_close)
     layout.addLayout(actions)
 
+    def _formatar_log(texto: str) -> str:
+        if chk_show_dates.isChecked():
+            return texto
+        linhas = []
+        for linha in texto.splitlines():
+            linhas.append(re.sub(r"^\\[[^\\]]+\\]\\s*", "", linha))
+        return "\n".join(linhas)
+
     def carregar_log(path: Path, widget: QTextEdit):
         if not path.exists():
-            widget.setPlainText("Log ainda nao foi criado.")
+            widget.setPlainText("O log ainda não foi criado.")
             return
         try:
+            bar = widget.verticalScrollBar()
+            at_bottom = bar.value() >= (bar.maximum() - 5)
+            prev_value = bar.value()
             conteudo = path.read_text(encoding="utf-8", errors="ignore")
-            widget.setPlainText(conteudo[-200000:])  # limita exibicao para desempenho
-            widget.moveCursor(QTextCursor.End)
+            exibicao = _formatar_log(conteudo[-200000:])  # limita exibicao para desempenho
+            widget.setPlainText(exibicao)
+            if chk_auto_scroll.isChecked() and at_bottom:
+                widget.moveCursor(QTextCursor.End)
+            else:
+                bar.setValue(prev_value)
         except Exception as e:
-            widget.setPlainText(f"Falha ao ler log: {e}")
+            widget.setPlainText(f"Falha ao ler o log: {e}")
 
     def carregar_ativos():
         carregar_log(caminho_log, text_main)
@@ -1498,10 +1670,32 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     timer.timeout.connect(carregar_ativos)
     timer.start()
 
+    def atualizar_timer():
+        if chk_pause_refresh.isChecked():
+            timer.stop()
+        else:
+            if not timer.isActive():
+                timer.start()
+        carregar_ativos()
+
+    def limpar_log():
+        idx = tabs.currentIndex()
+        path = caminho_log if idx == 0 else caminho_debug
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        except Exception as e:
+            log(f"Falha ao limpar log: {e}")
+        carregar_ativos()
+
     btn_refresh.clicked.connect(carregar_ativos)
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
+    chk_show_dates.stateChanged.connect(lambda *_: carregar_ativos())
+    chk_auto_scroll.stateChanged.connect(lambda *_: carregar_ativos())
+    chk_pause_refresh.stateChanged.connect(lambda *_: atualizar_timer())
+    btn_clear.clicked.connect(limpar_log)
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     carregar_ativos()
     dialog.exec()
@@ -1541,7 +1735,7 @@ def _abrir_relatorio(base_dir: Path, log=print):
         from PySide6.QtCore import Qt, QTimer
         from PySide6.QtGui import QTextCursor
     except Exception as e:
-        log(f"PySide6 nao encontrado para abrir relatorio: {e}")
+        log(f"PySide6 não encontrado para abrir relatório: {e}")
         return
 
     caminho = _report_path(base_dir)
@@ -1579,7 +1773,11 @@ def _abrir_relatorio(base_dir: Path, log=print):
 
     title = QLabel("Relatório de e-mails")
     title.setObjectName("title")
-    subtitle = QLabel(f"Arquivo: {caminho}")
+    subtitle = QLabel(
+        "Este relatório mostra o status dos e-mails e o motivo de cada decisão.\n"
+        "Legenda: RASCUNHO CRIADO, JÁ ENVIADO, PENDENTE, FALHA AO CRIAR RASCUNHO.\n"
+        f"Arquivo: {caminho}"
+    )
     subtitle.setObjectName("subtitle")
     layout.addWidget(title)
     layout.addWidget(subtitle)
@@ -1602,14 +1800,20 @@ def _abrir_relatorio(base_dir: Path, log=print):
 
     def carregar():
         if not caminho.exists():
-            text.setPlainText("Relatorio ainda nao foi criado.")
+            text.setPlainText("O relatório ainda não foi criado.")
             return
         try:
+            bar = text.verticalScrollBar()
+            at_bottom = bar.value() >= (bar.maximum() - 5)
+            prev_value = bar.value()
             conteudo = caminho.read_text(encoding="utf-8", errors="ignore")
             text.setPlainText(conteudo[-200000:])
-            text.moveCursor(QTextCursor.End)
+            if at_bottom:
+                text.moveCursor(QTextCursor.End)
+            else:
+                bar.setValue(prev_value)
         except Exception as e:
-            text.setPlainText(f"Falha ao ler relatorio: {e}")
+            text.setPlainText(f"Falha ao ler o relatório: {e}")
 
     def abrir_arquivo():
         try:
@@ -1620,7 +1824,7 @@ def _abrir_relatorio(base_dir: Path, log=print):
                 caminho.write_text("", encoding="utf-8")
                 os.startfile(str(caminho))
         except Exception as e:
-            log(f"Falha ao abrir arquivo de relatorio: {e}")
+            log(f"Falha ao abrir arquivo de relatório: {e}")
 
     timer = QTimer(dialog)
     timer.setInterval(3000)
@@ -1672,7 +1876,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
     cfg = _carregar_config(base_dir, log=log)
     repo = (cfg.get("github_repo") or "").strip()
     if not repo:
-        log("GitHub repo nao configurado. Defina em Configuração.")
+        log("GitHub repo não configurado. Defina em Configuração.")
         try:
             from PySide6.QtWidgets import QMessageBox, QApplication
             app = QApplication.instance() or QApplication(sys.argv)
@@ -1681,7 +1885,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
             pass
         return False
     if not getattr(sys, "frozen", False):
-        log("Atualização automatica so funciona no executavel (modo frozen).")
+        log("Atualização automática só funciona no executável (modo frozen).")
         return False
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
@@ -1689,14 +1893,14 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        log(f"Falha ao verificar atualizacao: {e}")
+        log(f"Falha ao verificar atualização: {e}")
         return False
 
     tag = data.get("tag_name") or data.get("name") or ""
     latest = _parse_version(tag)
     current = _parse_version(APP_VERSION)
     if latest <= current:
-        log(f"Atualização: voce ja esta na versao {APP_VERSION}.")
+        log(f"Atualização: você já está na versão {APP_VERSION}.")
         return False
 
     assets = data.get("assets") or []
@@ -1709,7 +1913,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
             exe_name = name
             break
     if not exe_url:
-        log("Atualização encontrada, mas nenhum .exe foi encontrado nos assets.")
+        log("Atualização encontrada, mas nenhum .exe foi encontrado nos arquivos do release.")
         return False
 
     if prompt:
@@ -1732,7 +1936,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
         temp_dir = Path(tempfile.gettempdir())
         destino = temp_dir / exe_name
         urllib.request.urlretrieve(exe_url, destino)
-        log(f"Atualizacao baixada: {destino}")
+        log(f"Atualização baixada: {destino}")
 
         exe_atual = Path(sys.executable)
         pid = os.getpid()
@@ -1756,7 +1960,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
         subprocess.Popen(["cmd", "/c", "start", "", str(bat)], shell=False)
         return True
     except Exception as e:
-        log(f"Falha ao baixar atualizacao: {e}")
+        log(f"Falha ao baixar atualização: {e}")
         return False
 
 
@@ -1856,9 +2060,9 @@ def _run_loop(stop_event: threading.Event, log):
     log("Monitorando PDFs/XML/BOLETOS (Ctrl+C para sair).")
     if not texto_mva and not texto_horizonte:
         if permitir_todos:
-            log("Filtro de texto vazio. PDF_ALLOW_ALL=1 ativo: movera qualquer PDF que passe pelo nome.")
+            log("Filtro de texto vazio. PDF_ALLOW_ALL=1 ativo: moverá qualquer PDF que passe pelo nome.")
         else:
-            log("Filtro de texto vazio. Nenhum PDF sera movido ate configurar PDF_TEXT_MATCH_MVA/HORIZONTE.")
+            log("Filtro de texto vazio. Nenhum PDF será movido até configurar PDF_TEXT_MATCH_MVA/HORIZONTE.")
     avisados = set()
     cache = {}
     cache_ttl = int(os.getenv("PDF_CACHE_TTL", "3600"))
@@ -1904,17 +2108,19 @@ def _run_loop(stop_event: threading.Event, log):
         )
         if nova_assinatura != assinatura_cfg:
             assinatura_cfg = nova_assinatura
-            log(f"Pasta observada PDF: {origem_pdf}")
-            log(f"Pasta observada XML: {origem_xml}")
-            log(f"Pasta observada BOLETO: {origem_boleto}")
-            log(f"Destino PDF MVA: {destino_mva}")
-            log(f"Destino PDF HORIZONTE: {destino_horizonte}")
-            log(f"Destino XML MVA: {destinos_xml['MVA']}")
-            log(f"Destino XML HORIZONTE: {destinos_xml['HORIZONTE']}")
-            log(f"Destino BOLETO MVA: {destino_boleto_mva}")
-            log(f"Destino BOLETO HORIZONTE: {destino_boleto_horizonte}")
+            log("Configuração carregada com sucesso.")
             log(f"Rascunho de e-mail: {'ATIVO' if email_ativo_novo else 'DESATIVADO'}")
             log(f"Debug detalhado: {'ATIVO' if debug_ativo_novo else 'DESATIVADO'}")
+            if debug_log:
+                debug_log(f"[CFG] Pasta observada PDF: {origem_pdf}")
+                debug_log(f"[CFG] Pasta observada XML: {origem_xml}")
+                debug_log(f"[CFG] Pasta observada BOLETO: {origem_boleto}")
+                debug_log(f"[CFG] Destino PDF MVA: {destino_mva}")
+                debug_log(f"[CFG] Destino PDF HORIZONTE: {destino_horizonte}")
+                debug_log(f"[CFG] Destino XML MVA: {destinos_xml['MVA']}")
+                debug_log(f"[CFG] Destino XML HORIZONTE: {destinos_xml['HORIZONTE']}")
+                debug_log(f"[CFG] Destino BOLETO MVA: {destino_boleto_mva}")
+                debug_log(f"[CFG] Destino BOLETO HORIZONTE: {destino_boleto_horizonte}")
             if email_ativo_novo and not email_ativo:
                 gmail_service = _gmail_service(base_dir, log=log)
                 if gmail_service:
@@ -1953,20 +2159,20 @@ def _run_loop(stop_event: threading.Event, log):
         else:
             chave_pdf = ("PDF", origem_pdf)
             if chave_pdf not in avisados:
-                log(f"Diretorio nao encontrado (PDF): {origem_pdf}")
+                log(f"Diretório não encontrado (PDF): {origem_pdf}")
                 avisados.add(chave_pdf)
             if debug_log:
-                debug_log(f"[PDF] Diretorio nao encontrado: {origem_pdf}")
+                debug_log(f"[PDF] Diretório não encontrado: {origem_pdf}")
 
         if origem_xml.exists():
             eventos.extend(processar_xmls(origem_xml, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log, debug_log=debug_log))
         else:
             chave_xml = ("XML", origem_xml)
             if chave_xml not in avisados:
-                log(f"Diretorio nao encontrado (XML): {origem_xml}")
+                log(f"Diretório não encontrado (XML): {origem_xml}")
                 avisados.add(chave_xml)
             if debug_log:
-                debug_log(f"[XML] Diretorio nao encontrado: {origem_xml}")
+                debug_log(f"[XML] Diretório não encontrado: {origem_xml}")
 
         if origem_boleto.exists():
             eventos.extend(
@@ -1984,10 +2190,10 @@ def _run_loop(stop_event: threading.Event, log):
         else:
             chave_boleto = ("BOLETO", origem_boleto)
             if chave_boleto not in avisados:
-                log(f"Diretorio nao encontrado (BOLETO): {origem_boleto}")
+                log(f"Diretório não encontrado (BOLETO): {origem_boleto}")
                 avisados.add(chave_boleto)
             if debug_log:
-                debug_log(f"[BOLETO] Diretorio nao encontrado: {origem_boleto}")
+                debug_log(f"[BOLETO] Diretório não encontrado: {origem_boleto}")
 
         if time.time() - last_state_reload >= 300:
             nfs_rascunho = _carregar_nfs_rascunho(base_dir, log=log)
@@ -2000,7 +2206,7 @@ def _run_loop(stop_event: threading.Event, log):
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
             if _verificar_atualizacao_github(base_dir, log=log, prompt=True):
-                log("Atualizacao iniciada. Encerrando aplicativo...")
+                log("Atualização iniciada. Encerrando o aplicativo...")
                 stop_event.set()
                 return
 
@@ -2047,8 +2253,8 @@ def _run_tray():
     menu = pystray.Menu(
         pystray.MenuItem("Configurar pastas", on_config),
         pystray.MenuItem("Ver logs", on_logs),
-        pystray.MenuItem("Relatorio", on_report),
-        pystray.MenuItem("Verificar atualizacao", on_update),
+        pystray.MenuItem("Relatório", on_report),
+        pystray.MenuItem("Verificar atualização", on_update),
         pystray.MenuItem("Sair", on_quit),
     )
     icon = pystray.Icon("PdfWatcher", _criar_icone_tray(), "PdfWatcher", menu)
@@ -2076,7 +2282,7 @@ def main():
             try:
                 from PySide6.QtWidgets import QMessageBox, QApplication
                 app = QApplication.instance() or QApplication(sys.argv)
-                QMessageBox.information(None, "PdfWatcher", "O aplicativo ja esta aberto.")
+                QMessageBox.information(None, "PdfWatcher", "O aplicativo já está aberto.")
             except Exception:
                 pass
             return

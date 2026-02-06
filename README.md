@@ -1,22 +1,25 @@
-﻿# PdfWatcher
+# PdfWatcher
 
-Aplicacao para monitorar pastas de PDF/XML e mover arquivos automaticamente para destinos separados (MVA e HORIZONTE), com organizacao por ano/mes.
+Windows desktop app that watches PDF/XML/BOLETO folders and moves files to company-specific destinations (MVA/HORIZONTE), organized by year/month. Includes Gmail draft creation, detailed logs, reports, and auto‑update via GitHub Releases.
 
-## Funcionalidades
+## Features
 
-- Monitora origem de PDF e XML separadamente.
-- Move PDF e XML para destinos separados por empresa.
-- Cria estrutura automatica `ANO/MES` no destino.
-- Interface de configuracao com **PySide6** (sem Tkinter e sem web).
-- Icone na bandeja com opcao **Configurar pastas**.
-- Configuracao persistida em `%APPDATA%\\PdfWatcher\\config.json`.
+- Watches separate source folders for PDF, XML, and BOLETO.
+- Moves files to MVA or HORIZONTE destinations.
+- Creates destination structure by date (PDF/XML: `YYYY/MONTH`; BOLETO: `MM-YYYY`).
+- PySide6 UI (no Tkinter, no web).
+- Tray icon with quick actions.
+- Persistent configuration in `%APPDATA%\\PdfWatcher\\config.json`.
+- Gmail draft creation and sent‑check to avoid duplicates.
+- Detailed debug log + report view.
+- Auto update via GitHub Releases (prompts before updating).
 
-## Requisitos
+## Requirements
 
 - Windows
-- Python 3.13 64-bit (recomendado)
+- Python 3.13 64‑bit (recommended)
 
-## Setup rapido (venv)
+## Quick setup (venv)
 
 ```powershell
 py -3.13 -m venv .venv
@@ -24,24 +27,30 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-## Execucao
+## Run
 
-- Rodar com tray:
+- With tray:
 
 ```powershell
 .\.venv\Scripts\python downloads_pdf_mover.py
 ```
 
-- Rodar sem tray (console):
+- Console only:
 
 ```powershell
 .\.venv\Scripts\python downloads_pdf_mover.py --no-tray
 ```
 
-- Abrir somente a tela de configuracao:
+- Open configuration UI only:
 
 ```powershell
 .\.venv\Scripts\python downloads_pdf_mover.py --config
+```
+
+- Open logs UI only:
+
+```powershell
+.\.venv\Scripts\python downloads_pdf_mover.py --logs
 ```
 
 ## Build EXE (PyInstaller)
@@ -51,9 +60,15 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\pyinstaller PdfWatcher.spec
 ```
 
-Saida esperada: `dist/PdfWatcher.exe`
+Expected output: `dist/PdfWatcher.exe`
 
-## Variaveis de ambiente opcionais
+## Auto update (GitHub Releases)
+
+1. Set the repo in Config (e.g. `AlleexMartinsT/AutoWriter`).
+2. Publish a GitHub Release with a `.exe` asset.
+3. The app will prompt to update, download the new EXE, replace the current one, and restart.
+
+## Optional environment variables
 
 - `PDF_NOME`
 - `PDF_PATTERN`
@@ -65,10 +80,14 @@ Saida esperada: `dist/PdfWatcher.exe`
 - `PDF_POLL_INTERVAL`
 - `PDF_CACHE_TTL`
 - `PDF_LOG_PATH`
+- `PDF_DEBUG_LOG_PATH`
+- `PDF_REPORT_PATH`
+- `PDF_REPORT_STATE_PATH`
+- `UPDATE_CHECK_INTERVAL` (seconds)
 
-## Estrutura principal
+## Key files
 
-- `downloads_pdf_mover.py` -> monitor e UI de configuracao.
-- `PdfWatcher.spec` -> build com PyInstaller.
-- `requirements.txt` -> dependencias de execucao.
-- `requirements-dev.txt` -> dependencias de build.
+- `downloads_pdf_mover.py` — main app + UI.
+- `PdfWatcher.spec` — PyInstaller build spec.
+- `requirements.txt` — runtime dependencies.
+- `requirements-dev.txt` — build dependencies.
