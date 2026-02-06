@@ -45,6 +45,7 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "email_enabled": "0",
         "debug_enabled": "0",
         "github_repo": "",
+        "auto_update_enabled": "1",
     }
 
 
@@ -98,6 +99,7 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
         "boleto_destino_horizonte": "BOLETO_DESTINO_DIR_HORIZONTE",
         "email_enabled": "EMAIL_DRAFT_ENABLED",
         "debug_enabled": "DEBUG_LOG_ENABLED",
+        "auto_update_enabled": "AUTO_UPDATE_ENABLED",
     }
     for key, env_key in env_map.items():
         val = os.getenv(env_key, "").strip()
@@ -1314,10 +1316,15 @@ def _abrir_interface_config(base_dir: Path, log=print):
     chk_email.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     main_layout.addWidget(chk_email)
 
-    chk_debug = QCheckBox("Ativar debug detalhado (log tecnico)")
+    chk_debug = QCheckBox("Ativar debug detalhado (log técnico)")
     chk_debug.setChecked((cfg.get("debug_enabled", "0").strip() == "1"))
     chk_debug.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     main_layout.addWidget(chk_debug)
+
+    chk_update = QCheckBox("Verificar atualização automaticamente")
+    chk_update.setChecked((cfg.get("auto_update_enabled", "1").strip() == "1"))
+    chk_update.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
+    main_layout.addWidget(chk_update)
 
     footer = QHBoxLayout()
     footer.addStretch(1)
@@ -1333,6 +1340,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
         novo_cfg = {chave: edits[chave].text().strip() for _, chave in campos}
         novo_cfg["email_enabled"] = "1" if chk_email.isChecked() else "0"
         novo_cfg["debug_enabled"] = "1" if chk_debug.isChecked() else "0"
+        novo_cfg["auto_update_enabled"] = "1" if chk_update.isChecked() else "0"
         faltantes = [k for k, v in novo_cfg.items() if not v]
         if faltantes:
             QMessageBox.warning(dialog, "Configuração", "Preencha todos os diretorios antes de salvar.")
@@ -1660,7 +1668,7 @@ def _parse_version(tag: str) -> tuple[int, int, int]:
     return tuple(nums[:3])
 
 
-def _verificar_atualizacao_github(base_dir: Path, log=print):
+def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> bool:
     cfg = _carregar_config(base_dir, log=log)
     repo = (cfg.get("github_repo") or "").strip()
     if not repo:
@@ -1671,7 +1679,10 @@ def _verificar_atualizacao_github(base_dir: Path, log=print):
             QMessageBox.information(None, "Atualização", "Configure o GitHub repo (usuario/repositorio) na tela de Configuração.")
         except Exception:
             pass
-        return
+        return False
+    if not getattr(sys, "frozen", False):
+        log("Atualização automatica so funciona no executavel (modo frozen).")
+        return False
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "PdfWatcher"})
@@ -1679,14 +1690,14 @@ def _verificar_atualizacao_github(base_dir: Path, log=print):
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         log(f"Falha ao verificar atualizacao: {e}")
-        return
+        return False
 
     tag = data.get("tag_name") or data.get("name") or ""
     latest = _parse_version(tag)
     current = _parse_version(APP_VERSION)
     if latest <= current:
         log(f"Atualização: voce ja esta na versao {APP_VERSION}.")
-        return
+        return False
 
     assets = data.get("assets") or []
     exe_url = None
@@ -1699,21 +1710,54 @@ def _verificar_atualizacao_github(base_dir: Path, log=print):
             break
     if not exe_url:
         log("Atualização encontrada, mas nenhum .exe foi encontrado nos assets.")
-        return
+        return False
+
+    if prompt:
+        try:
+            from PySide6.QtWidgets import QMessageBox, QApplication
+            app = QApplication.instance() or QApplication(sys.argv)
+            r = QMessageBox.question(
+                None,
+                "Atualização",
+                f"Nova versão encontrada ({tag}).\nDeseja atualizar agora?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if r != QMessageBox.Yes:
+                return False
+        except Exception:
+            pass
 
     try:
         temp_dir = Path(tempfile.gettempdir())
         destino = temp_dir / exe_name
         urllib.request.urlretrieve(exe_url, destino)
         log(f"Atualizacao baixada: {destino}")
-        try:
-            from PySide6.QtWidgets import QMessageBox, QApplication
-            app = QApplication.instance() or QApplication(sys.argv)
-            QMessageBox.information(None, "Atualização", f"Nova versao encontrada ({tag}).\nArquivo baixado em:\n{destino}\n\nFeche o app atual e execute o novo arquivo.")
-        except Exception:
-            pass
+
+        exe_atual = Path(sys.executable)
+        pid = os.getpid()
+        bat = temp_dir / f"PdfWatcher_update_{pid}.bat"
+        bat.write_text(
+            "\n".join([
+                "@echo off",
+                f"set PID={pid}",
+                f"set OLD_EXE={exe_atual}",
+                f"set NEW_EXE={destino}",
+                "timeout /t 2 /nobreak >nul",
+                ":wait",
+                "tasklist /FI \"PID eq %PID%\" | find \"%PID%\" >nul",
+                "if %errorlevel%==0 (timeout /t 1 >nul & goto wait)",
+                "move /Y \"%NEW_EXE%\" \"%OLD_EXE%\"",
+                "start \"\" \"%OLD_EXE%\"",
+                "del \"%~f0\"",
+            ]),
+            encoding="utf-8",
+        )
+        subprocess.Popen(["cmd", "/c", "start", "", str(bat)], shell=False)
+        return True
     except Exception as e:
         log(f"Falha ao baixar atualizacao: {e}")
+        return False
 
 
 def _fluxo_primeira_execucao(base_dir: Path, log=print):
@@ -1827,6 +1871,8 @@ def _run_loop(stop_event: threading.Event, log):
     email_ativo = False
     debug_ativo = False
     last_state_reload = time.time()
+    last_update_check = 0.0
+    update_interval = int(os.getenv("UPDATE_CHECK_INTERVAL", "3600"))
 
     while not stop_event.is_set():
         cfg = _carregar_config(base_dir, log=log)
@@ -1950,6 +1996,13 @@ def _run_loop(stop_event: threading.Event, log):
             last_state_reload = time.time()
             if debug_log:
                 debug_log("[LOOP] Estado recarregado (rascunhos/enviados/relatorio).")
+
+        if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
+            last_update_check = time.time()
+            if _verificar_atualizacao_github(base_dir, log=log, prompt=True):
+                log("Atualizacao iniciada. Encerrando aplicativo...")
+                stop_event.set()
+                return
 
         if eventos:
             _tentar_criar_rascunhos(base_dir, gmail_service, eventos, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
