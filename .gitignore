@@ -1,0 +1,32 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+watcher_debug.log
+report.txt
+report_state.json
+paths_debug.txt
+
+# Secrets / local state
+credentials.json
+client_secret_*.json
+token.json
+config.json
+
+# OS
+Thumbs.db
+.DS_Store
