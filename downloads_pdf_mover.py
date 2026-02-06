@@ -27,7 +27,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -125,7 +125,7 @@ def _salvar_config(base_dir: Path, cfg: dict[str, str]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 def _log(msg: str, log_path: Path):
-    ts = datetime.now().strftime("%d-%m-%Y")
+    ts = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
     linha = f"[{ts}] {msg}"
     print(linha)
     try:
@@ -159,7 +159,7 @@ def _salvar_report_state(base_dir: Path, state: dict[str, str], log=print) -> No
 
 def _registrar_relatorio(base_dir: Path, nf: str, status: str, motivo: str, log=print) -> None:
     path = _report_path(base_dir)
-    ts = datetime.now().strftime("%d-%m-%Y")
+    ts = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
     linha = f"[{ts}] NF{nf} | {status} | Motivo: {motivo}"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1569,7 +1569,6 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     title.setObjectName("title")
     subtitle = QLabel(
         "Aqui você encontra o histórico do programa.\n"
-        "Se você rolar para cima, o log não vai descer sozinho.\n"
         f"Log principal: {caminho_log}\n"
         f"Log técnico: {caminho_debug}"
     )
@@ -1591,16 +1590,20 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     settings_layout.setContentsMargins(14, 10, 14, 10)
     chk_show_dates = QCheckBox("Mostrar datas nos logs")
     chk_show_dates.setChecked(True)
+    chk_show_time = QCheckBox("Mostrar hora nos logs")
+    chk_show_time.setChecked(False)
     chk_auto_scroll = QCheckBox("Auto‑rolar para o final")
     chk_auto_scroll.setChecked(False)
     chk_pause_refresh = QCheckBox("Pausar atualização automática")
     chk_pause_refresh.setChecked(False)
     chk_show_dates.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
+    chk_show_time.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     chk_auto_scroll.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     chk_pause_refresh.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     btn_clear = QPushButton("Limpar log selecionado")
     btn_clear.setProperty("class", "secondary")
     settings_layout.addWidget(chk_show_dates)
+    settings_layout.addWidget(chk_show_time)
     settings_layout.addWidget(chk_auto_scroll)
     settings_layout.addWidget(chk_pause_refresh)
     settings_layout.addWidget(btn_clear)
@@ -1623,11 +1626,25 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     layout.addLayout(actions)
 
     def _formatar_log(texto: str) -> str:
-        if chk_show_dates.isChecked():
-            return texto
         linhas = []
         for linha in texto.splitlines():
-            linhas.append(re.sub(r"^\\[[^\\]]+\\]\\s*", "", linha))
+            if linha.startswith("[") and "]" in linha:
+                idx = linha.find("]")
+                prefixo = linha[1:idx]
+                resto = linha[idx + 1 :].lstrip()
+                if not chk_show_dates.isChecked():
+                    linhas.append(resto)
+                    continue
+                if " " in prefixo:
+                    data, hora = prefixo.split(" ", 1)
+                else:
+                    data, hora = prefixo, ""
+                if chk_show_time.isChecked() and hora:
+                    linhas.append(f"[{data} {hora}] {resto}")
+                else:
+                    linhas.append(f"[{data}] {resto}")
+                continue
+            linhas.append(linha)
         return "\n".join(linhas)
 
     def carregar_log(path: Path, widget: QTextEdit):
@@ -1679,8 +1696,27 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         carregar_ativos()
 
     def limpar_log():
-        idx = tabs.currentIndex()
-        path = caminho_log if idx == 0 else caminho_debug
+        try:
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(dialog)
+            box.setWindowTitle("Limpar logs")
+            box.setText("Qual log você deseja limpar?")
+            btn_main = box.addButton("Log principal", QMessageBox.AcceptRole)
+            btn_debug = box.addButton("Log técnico", QMessageBox.AcceptRole)
+            btn_report = box.addButton("Relatório", QMessageBox.AcceptRole)
+            box.addButton("Cancelar", QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == btn_main:
+                path = caminho_log
+            elif clicked == btn_debug:
+                path = caminho_debug
+            elif clicked == btn_report:
+                path = _report_path(base_dir)
+            else:
+                return
+        except Exception:
+            return
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("", encoding="utf-8")
@@ -1693,6 +1729,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
     chk_show_dates.stateChanged.connect(lambda *_: carregar_ativos())
+    chk_show_time.stateChanged.connect(lambda *_: carregar_ativos())
     chk_auto_scroll.stateChanged.connect(lambda *_: carregar_ativos())
     chk_pause_refresh.stateChanged.connect(lambda *_: atualizar_timer())
     btn_clear.clicked.connect(limpar_log)
@@ -2240,9 +2277,6 @@ def _run_tray():
     def on_logs(icon, item):
         _abrir_visualizador_logs_em_thread(base_dir, log=print)
 
-    def on_report(icon, item):
-        _abrir_relatorio(base_dir, log=print)
-
     def on_update(icon, item):
         _verificar_atualizacao_github(base_dir, log=print)
 
@@ -2253,7 +2287,6 @@ def _run_tray():
     menu = pystray.Menu(
         pystray.MenuItem("Configurar pastas", on_config),
         pystray.MenuItem("Ver logs", on_logs),
-        pystray.MenuItem("Relatório", on_report),
         pystray.MenuItem("Verificar atualização", on_update),
         pystray.MenuItem("Sair", on_quit),
     )
