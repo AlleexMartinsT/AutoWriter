@@ -1639,12 +1639,12 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             QLabel,
             QHBoxLayout,
             QPushButton,
-            QTextEdit,
+            QPlainTextEdit,
             QTabWidget,
             QWidget,
             QCheckBox,
         )
-        from PySide6.QtCore import Qt, QTimer
+        from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher
         from PySide6.QtGui import QTextCursor
     except Exception as e:
         log(f"PySide6 não encontrado para abrir logs: {e}")
@@ -1668,7 +1668,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         QLabel { color: #ffffff; }
         QLabel#title { font-size: 20px; font-weight: 700; color: #ff9f43; }
         QLabel#subtitle { color: #ffd7b0; }
-        QTextEdit {
+        QPlainTextEdit {
             background: #3a2418; color: #ffffff; border: 1px solid #b86a27;
             border-radius: 8px; padding: 8px; font-family: Consolas, monospace;
         }
@@ -1702,10 +1702,12 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     layout.addWidget(subtitle)
 
     tabs = QTabWidget()
-    text_main = QTextEdit()
+    text_main = QPlainTextEdit()
     text_main.setReadOnly(True)
-    text_debug = QTextEdit()
+    text_main.setMaximumBlockCount(4000)
+    text_debug = QPlainTextEdit()
     text_debug.setReadOnly(True)
+    text_debug.setMaximumBlockCount(4000)
     tabs.addTab(text_main, "Log principal")
     tabs.addTab(text_debug, "Log técnico (detalhado)")
 
@@ -1738,17 +1740,27 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
 
     actions = QHBoxLayout()
     btn_refresh = QPushButton("Atualizar")
+    btn_check_update = QPushButton("Verificar atualização")
     btn_open = QPushButton("Abrir arquivo")
     btn_report = QPushButton("Relatório")
     btn_open.setProperty("class", "secondary")
     btn_close = QPushButton("Fechar")
     btn_close.setProperty("class", "secondary")
     actions.addWidget(btn_refresh)
+    actions.addWidget(btn_check_update)
     actions.addWidget(btn_open)
     actions.addWidget(btn_report)
     actions.addStretch(1)
     actions.addWidget(btn_close)
     layout.addLayout(actions)
+
+    max_chars = 200000
+    tail_bytes = 320000
+    estados = {
+        "main": {"path": caminho_log, "widget": text_main, "offset": 0, "raw": ""},
+        "debug": {"path": caminho_debug, "widget": text_debug, "offset": 0, "raw": ""},
+    }
+    pending_keys: set[str] = set()
 
     def _formatar_log(texto: str) -> str:
         linhas = []
@@ -1772,27 +1784,89 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             linhas.append(linha)
         return "\n".join(linhas)
 
-    def carregar_log(path: Path, widget: QTextEdit):
-        if not path.exists():
+    def _renderizar_chave(chave: str, force_bottom: bool = False):
+        estado = estados[chave]
+        widget: QPlainTextEdit = estado["widget"]
+        raw = estado["raw"] or ""
+        if not raw and not estado["path"].exists():
             widget.setPlainText("O log ainda não foi criado.")
             return
         try:
             bar = widget.verticalScrollBar()
             at_bottom = bar.value() >= (bar.maximum() - 5)
             prev_value = bar.value()
-            conteudo = path.read_text(encoding="utf-8", errors="ignore")
-            exibicao = _formatar_log(conteudo[-200000:])  # limita exibicao para desempenho
+            exibicao = _formatar_log(raw)
             widget.setPlainText(exibicao)
-            if chk_auto_scroll.isChecked() and at_bottom:
+            if chk_auto_scroll.isChecked() and (at_bottom or force_bottom):
                 widget.moveCursor(QTextCursor.End)
             else:
                 bar.setValue(prev_value)
         except Exception as e:
             widget.setPlainText(f"Falha ao ler o log: {e}")
 
-    def carregar_ativos():
-        carregar_log(caminho_log, text_main)
-        carregar_log(caminho_debug, text_debug)
+    def _ler_cauda(path: Path) -> tuple[str, int]:
+        if not path.exists():
+            return "", 0
+        try:
+            size = path.stat().st_size
+            start = max(0, size - tail_bytes)
+            with path.open("rb") as f:
+                if start:
+                    f.seek(start)
+                data = f.read()
+            texto = data.decode("utf-8", errors="ignore")
+            return texto[-max_chars:], size
+        except Exception:
+            try:
+                texto = path.read_text(encoding="utf-8", errors="ignore")
+                return texto[-max_chars:], path.stat().st_size
+            except Exception:
+                return "", 0
+
+    def _recarregar_completo(chave: str, force_bottom: bool = False):
+        estado = estados[chave]
+        texto, size = _ler_cauda(estado["path"])
+        estado["raw"] = texto
+        estado["offset"] = size
+        _renderizar_chave(chave, force_bottom=force_bottom)
+
+    def _atualizar_incremental(chave: str):
+        estado = estados[chave]
+        path: Path = estado["path"]
+        if not path.exists():
+            estado["raw"] = ""
+            estado["offset"] = 0
+            _renderizar_chave(chave)
+            return
+        try:
+            size = path.stat().st_size
+        except Exception:
+            _recarregar_completo(chave)
+            return
+
+        offset = int(estado["offset"] or 0)
+        if size < offset:
+            _recarregar_completo(chave)
+            return
+        if size == offset:
+            return
+        try:
+            with path.open("rb") as f:
+                f.seek(offset)
+                data = f.read()
+            delta = data.decode("utf-8", errors="ignore")
+            estado["offset"] = size
+            estado["raw"] = ((estado["raw"] or "") + delta)[-max_chars:]
+            _renderizar_chave(chave)
+        except Exception:
+            _recarregar_completo(chave)
+
+    def carregar_ativos(force_full: bool = False):
+        if force_full:
+            _recarregar_completo("main", force_bottom=True)
+            _recarregar_completo("debug", force_bottom=True)
+            return
+        agendar_atualizacao({"main", "debug"}, delay_ms=0)
 
     def abrir_arquivo():
         try:
@@ -1807,18 +1881,80 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         except Exception as e:
             log(f"Falha ao abrir arquivo de log: {e}")
 
+    debounce = QTimer(dialog)
+    debounce.setSingleShot(True)
+    debounce.setInterval(180)
+
+    def processar_pendencias():
+        if chk_pause_refresh.isChecked():
+            return
+        keys = list(pending_keys)
+        pending_keys.clear()
+        for chave in keys:
+            _atualizar_incremental(chave)
+
+    debounce.timeout.connect(processar_pendencias)
+
+    watcher = QFileSystemWatcher(dialog)
+    watched_dirs = {str(caminho_log.parent), str(caminho_debug.parent)}
+    watcher.addPaths(list(watched_dirs))
+
+    def _watched_files() -> set[str]:
+        return set(watcher.files())
+
+    def _garantir_watch_arquivo(path: Path):
+        p = str(path)
+        if path.exists() and p not in _watched_files():
+            watcher.addPath(p)
+
+    _garantir_watch_arquivo(caminho_log)
+    _garantir_watch_arquivo(caminho_debug)
+
+    def _chave_por_caminho(caminho: str) -> str | None:
+        if Path(caminho) == caminho_log:
+            return "main"
+        if Path(caminho) == caminho_debug:
+            return "debug"
+        return None
+
+    def agendar_atualizacao(chaves: set[str], delay_ms: int = 180):
+        if chk_pause_refresh.isChecked():
+            return
+        pending_keys.update(chaves)
+        debounce.start(max(0, delay_ms))
+
+    def on_file_changed(caminho: str):
+        chave = _chave_por_caminho(caminho)
+        if chave:
+            _garantir_watch_arquivo(estados[chave]["path"])
+            agendar_atualizacao({chave})
+
+    def on_dir_changed(caminho: str):
+        chaves = set()
+        for chave, estado in estados.items():
+            if str(estado["path"].parent) == caminho:
+                _garantir_watch_arquivo(estado["path"])
+                chaves.add(chave)
+        if chaves:
+            agendar_atualizacao(chaves)
+
+    watcher.fileChanged.connect(on_file_changed)
+    watcher.directoryChanged.connect(on_dir_changed)
+
     timer = QTimer(dialog)
-    timer.setInterval(2000)
-    timer.timeout.connect(carregar_ativos)
+    timer.setInterval(12000)
+    timer.timeout.connect(lambda: agendar_atualizacao({"main", "debug"}))
     timer.start()
 
     def atualizar_timer():
         if chk_pause_refresh.isChecked():
+            pending_keys.clear()
+            debounce.stop()
             timer.stop()
         else:
             if not timer.isActive():
                 timer.start()
-        carregar_ativos()
+            agendar_atualizacao({"main", "debug"}, delay_ms=0)
 
     def limpar_log():
         try:
@@ -1834,10 +1970,13 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             clicked = box.clickedButton()
             if clicked == btn_main:
                 path = caminho_log
+                chave = "main"
             elif clicked == btn_debug:
                 path = caminho_debug
+                chave = "debug"
             elif clicked == btn_report:
                 path = _report_path(base_dir)
+                chave = None
             else:
                 return
         except Exception:
@@ -1847,7 +1986,11 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             path.write_text("", encoding="utf-8")
         except Exception as e:
             log(f"Falha ao limpar log: {e}")
-        carregar_ativos()
+        if chave:
+            _recarregar_completo(chave, force_bottom=True)
+            _garantir_watch_arquivo(path)
+        else:
+            carregar_ativos(force_full=True)
 
     def salvar_viewer():
         _salvar_viewer_settings(
@@ -1861,17 +2004,19 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             log=log,
         )
 
-    btn_refresh.clicked.connect(carregar_ativos)
+    btn_refresh.clicked.connect(lambda: carregar_ativos(force_full=True))
+    btn_check_update.clicked.connect(lambda: _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=True))
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
-    chk_show_dates.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
-    chk_show_time.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
+    chk_show_dates.stateChanged.connect(lambda *_: (salvar_viewer(), _renderizar_chave("main"), _renderizar_chave("debug")))
+    chk_show_time.stateChanged.connect(lambda *_: (salvar_viewer(), _renderizar_chave("main"), _renderizar_chave("debug")))
     chk_auto_scroll.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
     chk_pause_refresh.stateChanged.connect(lambda *_: (salvar_viewer(), atualizar_timer()))
     btn_clear.clicked.connect(limpar_log)
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-    carregar_ativos()
+    _recarregar_completo("main", force_bottom=True)
+    _recarregar_completo("debug", force_bottom=True)
     dialog.exec()
 
     if created_app:
@@ -2046,14 +2191,37 @@ def _parse_version(tag: str) -> tuple[int, int, int]:
     return tuple(nums[:3])
 
 
-def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> bool:
+def _notificar_usuario_atualizacao(titulo: str, mensagem: str) -> None:
+    try:
+        from PySide6.QtWidgets import QMessageBox, QApplication
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.information(None, titulo, mensagem)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.MessageBoxW(None, mensagem, titulo, 0x40)
+    except Exception:
+        pass
+
+
+def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify=False) -> bool:
     repo = GITHUB_REPO
     if not getattr(sys, "frozen", False):
-        log("Atualização automática só funciona no executável (modo frozen).")
+        msg = "Verificação de atualização só funciona no executável (.exe)."
+        log(msg)
+        if notify:
+            _notificar_usuario_atualizacao("Atualização", msg)
         return False
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "PdfWatcher"})
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "PdfWatcher",
+                "Accept": "application/vnd.github+json",
+            },
+        )
         try:
             import certifi
             ctx = ssl.create_default_context(cafile=certifi.where())
@@ -2063,13 +2231,18 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
             data = json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         log(f"Falha ao verificar atualização: {e}")
+        if notify:
+            _notificar_usuario_atualizacao("Atualização", f"Falha ao verificar atualização.\n{e}")
         return False
 
     tag = data.get("tag_name") or data.get("name") or ""
     latest = _parse_version(tag)
     current = _parse_version(APP_VERSION)
     if latest <= current:
-        log(f"Atualização: você já está na versão {APP_VERSION}.")
+        msg = f"Você já está na versão mais recente ({APP_VERSION})."
+        log(f"Atualização: {msg}")
+        if notify:
+            _notificar_usuario_atualizacao("Atualização", msg)
         return False
 
     assets = data.get("assets") or []
@@ -2082,7 +2255,10 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
             exe_name = name
             break
     if not exe_url:
-        log("Atualização encontrada, mas nenhum .exe foi encontrado nos arquivos do release.")
+        msg = "Atualização encontrada, mas nenhum .exe foi encontrado nos arquivos do release."
+        log(msg)
+        if notify:
+            _notificar_usuario_atualizacao("Atualização", msg)
         return False
 
     if prompt:
@@ -2136,6 +2312,8 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True) -> boo
         return True
     except Exception as e:
         log(f"Falha ao baixar atualização: {e}")
+        if notify:
+            _notificar_usuario_atualizacao("Atualização", f"Falha ao baixar atualização.\n{e}")
         return False
 
 
@@ -2380,7 +2558,7 @@ def _run_loop(stop_event: threading.Event, log):
 
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
-            if _verificar_atualizacao_github(base_dir, log=log, prompt=True):
+            if _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=False):
                 log("Atualização iniciada. Encerrando o aplicativo...")
                 stop_event.set()
                 return
@@ -2416,7 +2594,7 @@ def _run_tray():
         _abrir_visualizador_logs_em_thread(base_dir, log=print)
 
     def on_update(icon, item):
-        _verificar_atualizacao_github(base_dir, log=print)
+        _verificar_atualizacao_github(base_dir, log=print, prompt=True, notify=True)
 
     def on_quit(icon, item):
         stop_event.set()
