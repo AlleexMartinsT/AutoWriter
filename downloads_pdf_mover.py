@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -570,29 +570,52 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
                     pagador = _normalizar_nome_arquivo(nome)
                     break
 
-    m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,120}?([0-9]{6,})", texto, re.IGNORECASE)
-    nosso_numero = m_nosso.group(1) if m_nosso else None
+    def _nosso_valido(valor: str | None) -> bool:
+        if not valor:
+            return False
+        v = re.sub(r"\D", "", valor)
+        if not v:
+            return False
+        # Evita telefone do SAC (0800...) sendo tratado como nosso número.
+        if v.startswith("0800") and len(v) <= 11:
+            return False
+        return len(v) >= 6
+
+    def _escolher_melhor_nosso(candidatos: list[str]) -> str | None:
+        validos = [c for c in candidatos if _nosso_valido(c)]
+        if not validos:
+            return None
+        # Prefere formato completo com hífen, depois o mais longo.
+        validos.sort(key=lambda c: (1 if "-" in c else 0, len(re.sub(r"\D", "", c))), reverse=True)
+        return validos[0]
+
+    nosso_numero = None
+    # Caixa costuma trazer formato completo com hífen (ex.: 14000000178995139-1).
+    m_cx = re.findall(r"\b(\d{11,20}-\d{1,2})\b", texto)
+    nosso_numero = _escolher_melhor_nosso(m_cx)
+    if not nosso_numero:
+        m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,120}?([0-9]{6,})", texto, re.IGNORECASE)
+        if m_nosso and _nosso_valido(m_nosso.group(1)):
+            nosso_numero = m_nosso.group(1)
     if not nosso_numero:
         linhas = [ln.strip() for ln in texto.splitlines()]
         for i, ln in enumerate(linhas):
             if re.search(r"Nosso\s*n[uú]mero", ln, re.IGNORECASE):
                 janela = " ".join(linhas[i:i+5])
-                m_alt = re.search(r"\b(\d{4,}-?\d{0,2})\b", janela)
-                if m_alt:
-                    nosso_numero = m_alt.group(1)
+                cands = re.findall(r"\b(\d{4,}-?\d{0,2})\b", janela)
+                nosso_numero = _escolher_melhor_nosso(cands)
                 break
     if not nosso_numero:
         linhas = [ln.strip() for ln in texto.splitlines()]
         for ln in linhas:
             if nf and nf in ln and re.search(r"\bDM\b|\bN\b", ln):
-                m_alt = re.search(r"\b(\d{4,}-\d)\b", ln)
-                if m_alt:
-                    nosso_numero = m_alt.group(1)
+                cands = re.findall(r"\b(\d{4,}-\d{1,2})\b", ln)
+                nosso_numero = _escolher_melhor_nosso(cands)
+                if nosso_numero:
                     break
     if not nosso_numero:
-        m_alt = re.findall(r"\b(\d{4,}-\d)\b", texto)
-        if m_alt:
-            nosso_numero = m_alt[-1]
+        cands = re.findall(r"\b(\d{4,}-\d{1,2})\b", texto)
+        nosso_numero = _escolher_melhor_nosso(cands)
 
     beneficiario = _extrair_beneficiario(texto)
     if beneficiario:
