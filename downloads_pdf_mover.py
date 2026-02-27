@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -407,6 +407,8 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
     def _extrair_pagador(txt: str) -> str | None:
         linhas = [ln.strip() for ln in txt.splitlines()]
         cnpj_re = re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b")
+        texto_mva = os.getenv("BOLETO_TEXT_MATCH_MVA", "MVA").strip()
+        texto_horizonte = os.getenv("BOLETO_TEXT_MATCH_HORIZONTE", "HORIZONTE").strip()
         blacklist = {
             "DADOS DO PAGADOR",
             "DADOS DO PAGADOR/AVALISTA",
@@ -439,6 +441,16 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
             nome = re.sub(r"\s+CNPJ[:\s].*$", "", nome, flags=re.IGNORECASE).strip()
             return nome
 
+        def _nome_parece_emitente(nome: str) -> bool:
+            comp = _texto_compacto(nome)
+            if texto_mva and _texto_compacto(texto_mva) in comp:
+                return True
+            if texto_horizonte and _texto_compacto(texto_horizonte) in comp:
+                return True
+            return False
+
+        candidato_emitente = None
+
         # 1) Procurar bloco "Pagador" e usar a primeira linha útil abaixo dele.
         for i, ln in enumerate(linhas):
             if not ln:
@@ -448,6 +460,9 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
                 if m:
                     nome = _limpar_nome_linha(m.group(1))
                     if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
+                        if _nome_parece_emitente(nome):
+                            candidato_emitente = candidato_emitente or nome
+                            continue
                         return nome
                 for j in range(i + 1, min(i + 8, len(linhas))):
                     cand = linhas[j].strip()
@@ -459,6 +474,9 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
                         break
                     nome = _limpar_nome_linha(cand)
                     if nome and not _nome_boleto_parece_invalido(nome):
+                        if _nome_parece_emitente(nome):
+                            candidato_emitente = candidato_emitente or nome
+                            continue
                         return nome
 
         # 2) Fallback: linha que contenha CNPJ e pareça nome do pagador.
@@ -471,7 +489,12 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
                 continue
             nome = _limpar_nome_linha(ln)
             if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
+                if _nome_parece_emitente(nome):
+                    candidato_emitente = candidato_emitente or nome
+                    continue
                 return nome
+        if candidato_emitente:
+            return candidato_emitente
         return None
 
     def _extrair_beneficiario(txt: str) -> str | None:
@@ -1234,10 +1257,6 @@ def processar_boletos(
             erros_extracao.append(f"beneficiario_invalido={beneficiario}")
         if pagador and beneficiario and _texto_compacto(pagador) == _texto_compacto(beneficiario):
             erros_extracao.append("pagador_igual_beneficiario")
-        if pagador and texto_mva and _texto_compacto(texto_mva) in _texto_compacto(pagador):
-            erros_extracao.append("pagador_com_nome_mva")
-        if pagador and texto_horizonte and _texto_compacto(texto_horizonte) in _texto_compacto(pagador):
-            erros_extracao.append("pagador_com_nome_horizonte")
         if erros_extracao:
             log(f"Boleto ignorado por falha de extração ({caminho.name}): {'; '.join(erros_extracao)}")
             if debug_log:
@@ -2005,7 +2024,9 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         )
 
     btn_refresh.clicked.connect(lambda: carregar_ativos(force_full=True))
-    btn_check_update.clicked.connect(lambda: _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=True))
+    btn_check_update.clicked.connect(
+        lambda: _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=True, exit_on_success=True)
+    )
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
@@ -2205,7 +2226,7 @@ def _notificar_usuario_atualizacao(titulo: str, mensagem: str) -> None:
         pass
 
 
-def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify=False) -> bool:
+def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify=False, exit_on_success=False) -> bool:
     repo = GITHUB_REPO
     if not getattr(sys, "frozen", False):
         msg = "Verificação de atualização só funciona no executável (.exe)."
@@ -2309,6 +2330,17 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
             encoding="utf-8",
         )
         subprocess.Popen(["cmd", "/c", "start", "", str(bat)], shell=False)
+        if exit_on_success:
+            log("Atualização iniciada. Encerrando o aplicativo...")
+            try:
+                from PySide6.QtWidgets import QApplication
+                app = QApplication.instance()
+                if app is not None:
+                    app.quit()
+            except Exception:
+                pass
+            # Em verificações manuais (tray/tela de logs), sem este encerramento o .bat fica aguardando o PID.
+            os._exit(0)
         return True
     except Exception as e:
         log(f"Falha ao baixar atualização: {e}")
@@ -2594,7 +2626,7 @@ def _run_tray():
         _abrir_visualizador_logs_em_thread(base_dir, log=print)
 
     def on_update(icon, item):
-        _verificar_atualizacao_github(base_dir, log=print, prompt=True, notify=True)
+        _verificar_atualizacao_github(base_dir, log=print, prompt=True, notify=True, exit_on_success=True)
 
     def on_quit(icon, item):
         stop_event.set()
