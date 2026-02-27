@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.7"
+APP_VERSION = "1.1.8"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -654,8 +654,9 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
     pagador_curto = " ".join(palavras[:2]).strip() if palavras else pagador_norm
     final_nosso = nosso_num
     if final_nosso:
-        # Mantém o formato completo em boletos com hífen (ex.: 7239-1).
-        if "-" not in final_nosso or len(final_nosso) > 10:
+        # Mantém o formato completo quando vier com hífen (ex.: 7239-1, 14000000178980268-0).
+        # Só reduz para os últimos 4 dígitos quando não houver hífen.
+        if "-" not in final_nosso:
             final_nosso = final_nosso[-4:] if len(final_nosso) >= 4 else final_nosso
     sufixo = f" BLT {final_nosso}" if final_nosso else ""
     return f"BOLETO NF{nf} {pagador_curto}{sufixo}.pdf"
@@ -2048,7 +2049,14 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
 
     btn_refresh.clicked.connect(lambda: carregar_ativos(force_full=True))
     btn_check_update.clicked.connect(
-        lambda: _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=True, exit_on_success=True)
+        lambda: _verificar_atualizacao_github(
+            base_dir,
+            log=log,
+            prompt=True,
+            notify=True,
+            exit_on_success=True,
+            use_native_dialogs=False,
+        )
     )
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
@@ -2235,7 +2243,13 @@ def _parse_version(tag: str) -> tuple[int, int, int]:
     return tuple(nums[:3])
 
 
-def _notificar_usuario_atualizacao(titulo: str, mensagem: str) -> None:
+def _notificar_usuario_atualizacao(titulo: str, mensagem: str, prefer_native: bool = False) -> None:
+    if prefer_native:
+        try:
+            ctypes.windll.user32.MessageBoxW(None, mensagem, titulo, 0x40)
+            return
+        except Exception:
+            pass
     try:
         from PySide6.QtWidgets import QMessageBox, QApplication
         app = QApplication.instance() or QApplication(sys.argv)
@@ -2249,13 +2263,20 @@ def _notificar_usuario_atualizacao(titulo: str, mensagem: str) -> None:
         pass
 
 
-def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify=False, exit_on_success=False) -> bool:
+def _verificar_atualizacao_github(
+    base_dir: Path,
+    log=print,
+    prompt=True,
+    notify=False,
+    exit_on_success=False,
+    use_native_dialogs=False,
+) -> bool:
     repo = GITHUB_REPO
     if not getattr(sys, "frozen", False):
         msg = "Verificação de atualização só funciona no executável (.exe)."
         log(msg)
         if notify:
-            _notificar_usuario_atualizacao("Atualização", msg)
+            _notificar_usuario_atualizacao("Atualização", msg, prefer_native=use_native_dialogs)
         return False
     url = f"https://api.github.com/repos/{repo}/releases/latest"
     try:
@@ -2276,7 +2297,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
     except Exception as e:
         log(f"Falha ao verificar atualização: {e}")
         if notify:
-            _notificar_usuario_atualizacao("Atualização", f"Falha ao verificar atualização.\n{e}")
+            _notificar_usuario_atualizacao("Atualização", f"Falha ao verificar atualização.\n{e}", prefer_native=use_native_dialogs)
         return False
 
     tag = data.get("tag_name") or data.get("name") or ""
@@ -2286,7 +2307,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
         msg = f"Você já está na versão mais recente ({APP_VERSION})."
         log(f"Atualização: {msg}")
         if notify:
-            _notificar_usuario_atualizacao("Atualização", msg)
+            _notificar_usuario_atualizacao("Atualização", msg, prefer_native=use_native_dialogs)
         return False
 
     assets = data.get("assets") or []
@@ -2302,24 +2323,40 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
         msg = "Atualização encontrada, mas nenhum .exe foi encontrado nos arquivos do release."
         log(msg)
         if notify:
-            _notificar_usuario_atualizacao("Atualização", msg)
+            _notificar_usuario_atualizacao("Atualização", msg, prefer_native=use_native_dialogs)
         return False
 
     if prompt:
-        try:
-            from PySide6.QtWidgets import QMessageBox, QApplication
-            app = QApplication.instance() or QApplication(sys.argv)
-            r = QMessageBox.question(
-                None,
-                "Atualização",
-                f"Nova versão encontrada ({tag}).\nDeseja atualizar agora?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if r != QMessageBox.Yes:
-                return False
-        except Exception:
-            pass
+        if use_native_dialogs:
+            try:
+                MB_YESNO = 0x04
+                MB_ICONQUESTION = 0x20
+                IDYES = 6
+                r = ctypes.windll.user32.MessageBoxW(
+                    None,
+                    f"Nova versão encontrada ({tag}).\nDeseja atualizar agora?",
+                    "Atualização",
+                    MB_YESNO | MB_ICONQUESTION,
+                )
+                if r != IDYES:
+                    return False
+            except Exception:
+                pass
+        else:
+            try:
+                from PySide6.QtWidgets import QMessageBox, QApplication
+                app = QApplication.instance() or QApplication(sys.argv)
+                r = QMessageBox.question(
+                    None,
+                    "Atualização",
+                    f"Nova versão encontrada ({tag}).\nDeseja atualizar agora?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if r != QMessageBox.Yes:
+                    return False
+            except Exception:
+                pass
 
     try:
         temp_dir = Path(tempfile.gettempdir())
@@ -2344,7 +2381,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
                 f"set NEW_EXE={destino}",
                 "timeout /t 2 /nobreak >nul",
                 ":wait",
-                "tasklist /FI \"PID eq %PID%\" | find \"%PID%\" >nul",
+                "tasklist /FI \"PID eq %PID%\" 2>nul | findstr /I \"%PID%\" >nul",
                 "if %errorlevel%==0 (timeout /t 1 >nul & goto wait)",
                 "move /Y \"%NEW_EXE%\" \"%OLD_EXE%\"",
                 "start \"\" \"%OLD_EXE%\"",
@@ -2352,7 +2389,8 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
             ]),
             encoding="utf-8",
         )
-        subprocess.Popen(["cmd", "/c", "start", "", str(bat)], shell=False)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(["cmd", "/c", str(bat)], shell=False, creationflags=creationflags)
         if exit_on_success:
             log("Atualização iniciada. Encerrando o aplicativo...")
             try:
@@ -2368,7 +2406,7 @@ def _verificar_atualizacao_github(base_dir: Path, log=print, prompt=True, notify
     except Exception as e:
         log(f"Falha ao baixar atualização: {e}")
         if notify:
-            _notificar_usuario_atualizacao("Atualização", f"Falha ao baixar atualização.\n{e}")
+            _notificar_usuario_atualizacao("Atualização", f"Falha ao baixar atualização.\n{e}", prefer_native=use_native_dialogs)
         return False
 
 
@@ -2613,10 +2651,9 @@ def _run_loop(stop_event: threading.Event, log):
 
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
-            if _verificar_atualizacao_github(base_dir, log=log, prompt=True, notify=False):
+            if _verificar_atualizacao_github(base_dir, log=log, prompt=False, notify=False):
                 log("Atualização iniciada. Encerrando o aplicativo...")
-                stop_event.set()
-                return
+                os._exit(0)
 
         if eventos:
             _tentar_criar_rascunhos(base_dir, gmail_service, eventos, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
@@ -2649,7 +2686,14 @@ def _run_tray():
         _abrir_visualizador_logs_em_thread(base_dir, log=print)
 
     def on_update(icon, item):
-        _verificar_atualizacao_github(base_dir, log=print, prompt=True, notify=True, exit_on_success=True)
+        _verificar_atualizacao_github(
+            base_dir,
+            log=print,
+            prompt=True,
+            notify=True,
+            exit_on_success=True,
+            use_native_dialogs=True,
+        )
 
     def on_quit(icon, item):
         stop_event.set()
