@@ -1,6 +1,6 @@
 Boa tarde!!!
 
-Segue em anexo XML PDF NF19427 + BOLETO
+Segue em anexo XML PDF NF{NF} + BOLETO
 
 ***Favor confirmar e-mail***
 Att

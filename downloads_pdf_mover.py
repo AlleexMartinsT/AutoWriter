@@ -308,6 +308,40 @@ def _normalizar_nome_arquivo(nome: str) -> str:
     return n
 
 
+def _texto_compacto(valor: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _normalizar_nome_arquivo(valor).lower())
+
+
+def _linha_digitavel_boleto(valor: str) -> bool:
+    return bool(re.search(r"\b\d{5}\.\d{5}\b", valor) or re.search(r"^\d{3}-\d\b", valor))
+
+
+def _nome_boleto_parece_invalido(nome: str | None) -> bool:
+    if not nome:
+        return True
+    n = _normalizar_nome_arquivo(nome).strip()
+    if not n:
+        return True
+    u = n.upper()
+    if _linha_digitavel_boleto(n):
+        return True
+    if re.search(r"https?://|AUTOATENDIMENTO|\.BB\.COM\.BR", u):
+        return True
+    if re.search(r"\b(PAGADOR|BENEFICIARIO|CEDENTE|SACADOR|AVALISTA|NOSSO NUMERO|AGENCIA/CODIGO)\b", u):
+        return True
+    if re.search(r"\b(ENDERECO|MUNICIPIO UF CEP|NUMERO DO DOCUMENTO|DADOS DO PAGADOR|FICHA DE COMPENSACAO|LOCAL DE PAGAMENTO|COOPERATIVA CONTRATANTE|AUTENTICACAO MECANICA)\b", u):
+        return True
+    if re.search(r"\b(NOTA FISCAL|CHAVE DE ACESSO|NFE REF|DANFE|EMISSAO)\b", u):
+        return True
+    letras = len(re.findall(r"[A-Z]", u))
+    digitos = len(re.findall(r"\d", u))
+    if letras == 0:
+        return True
+    if digitos > letras:
+        return True
+    return False
+
+
 def _ler_texto_arquivo(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8", errors="ignore")
@@ -389,25 +423,31 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
             "MUNICÍPIO UF CEP",
             "MENSAGEM PAGADOR",
         }
-        # 1) Preferir linha com CNPJ (normalmente vem com o nome do pagador)
-        for ln in linhas:
-            if not ln:
-                continue
-            if cnpj_re.search(ln):
-                if re.search(r"benefici[aá]rio|cedente|sacador|avalista", ln, re.IGNORECASE):
-                    continue
-                nome = cnpj_re.split(ln)[0].strip()
-                if nome and nome.upper() not in blacklist:
-                    return nome
-        # 2) Fallback: procurar região de "Pagador"
+        labels_pagador = (
+            r"nome do pagador",
+            r"^pagador$",
+            r"pagador/avalista",
+            r"dados do pagador",
+            r"dados do sacado",
+        )
+
+        def _limpar_nome_linha(ln: str) -> str:
+            nome = ln.strip()
+            if cnpj_re.search(nome):
+                nome = cnpj_re.split(nome)[0].strip()
+            nome = re.sub(r"\s*-\s*CNPJ.*$", "", nome, flags=re.IGNORECASE).strip()
+            nome = re.sub(r"\s+CNPJ[:\s].*$", "", nome, flags=re.IGNORECASE).strip()
+            return nome
+
+        # 1) Procurar bloco "Pagador" e usar a primeira linha útil abaixo dele.
         for i, ln in enumerate(linhas):
             if not ln:
                 continue
-            if re.search(r"\bPAGADOR\b", ln, re.IGNORECASE):
-                m = re.search(r"PAGADOR\\s*[:\\-]\\s*(.+)$", ln, re.IGNORECASE)
+            if any(re.search(rx, ln, re.IGNORECASE) for rx in labels_pagador):
+                m = re.search(r"PAGADOR\s*[:\-]\s*(.+)$", ln, re.IGNORECASE)
                 if m:
-                    nome = m.group(1).strip()
-                    if nome and nome.upper() not in blacklist:
+                    nome = _limpar_nome_linha(m.group(1))
+                    if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
                         return nome
                 for j in range(i + 1, min(i + 8, len(linhas))):
                     cand = linhas[j].strip()
@@ -415,20 +455,42 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
                         continue
                     if cand.upper() in blacklist:
                         continue
-                    return cand
+                    if re.search(r"benefici[aá]rio|cedente|sacador|avalista", cand, re.IGNORECASE):
+                        break
+                    nome = _limpar_nome_linha(cand)
+                    if nome and not _nome_boleto_parece_invalido(nome):
+                        return nome
+
+        # 2) Fallback: linha que contenha CNPJ e pareça nome do pagador.
+        for ln in linhas:
+            if not ln or not cnpj_re.search(ln):
+                continue
+            if _linha_digitavel_boleto(ln):
+                continue
+            if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
+                continue
+            nome = _limpar_nome_linha(ln)
+            if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
+                return nome
         return None
 
     def _extrair_beneficiario(txt: str) -> str | None:
         linhas = [ln.strip() for ln in txt.splitlines()]
         texto_mva = os.getenv("BOLETO_TEXT_MATCH_MVA", "MVA").strip()
         texto_horizonte = os.getenv("BOLETO_TEXT_MATCH_HORIZONTE", "HORIZONTE").strip()
+
+        def _contem_termo_esperado(ln: str, termo: str) -> bool:
+            if not termo:
+                return False
+            return _texto_compacto(termo) in _texto_compacto(ln)
+
         # 1) Prioriza linhas que contenham o nome esperado (MVA/HORIZONTE)
         for ln in linhas:
             if not ln:
                 continue
-            if texto_mva and texto_mva.lower() in ln.lower():
+            if _contem_termo_esperado(ln, texto_mva):
                 return ln
-            if texto_horizonte and texto_horizonte.lower() in ln.lower():
+            if _contem_termo_esperado(ln, texto_horizonte):
                 return ln
 
         blacklist = {
@@ -443,20 +505,26 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
             "NOSSO NÚMERO",
             "VALOR DOCUMENTO",
         }
-        cand = None
+
+        def _nome_beneficiario_valido(ln: str) -> bool:
+            if not ln:
+                return False
+            if ln.upper() in blacklist:
+                return False
+            if re.search(r"benefici[aá]rio", ln, re.IGNORECASE):
+                return False
+            return not _nome_boleto_parece_invalido(ln)
+
+        # 2) Procurar bloco de beneficiário.
         for i, ln in enumerate(linhas):
-            if re.search(r"\bbenefici[aá]rio\b", ln, re.IGNORECASE) and ln.strip().lower() in {"beneficiario", "beneficiário"}:
+            if re.search(r"nome do benefici[aá]rio|\bbenefici[aá]rio\b", ln, re.IGNORECASE):
                 for j in range(i + 1, min(i + 6, len(linhas))):
                     v = linhas[j].strip()
                     if not v:
                         continue
-                    if v.upper() in blacklist:
+                    if not _nome_beneficiario_valido(v):
                         continue
-                    if re.search(r"benefici[aá]rio", v, re.IGNORECASE):
-                        continue
-                    cand = v
-                if cand:
-                    return cand
+                    return v
         return None
 
     pagador = _extrair_pagador(texto)
@@ -469,11 +537,13 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
         for ln in linhas:
             if not ln:
                 continue
+            if _linha_digitavel_boleto(ln):
+                continue
             if cnpj_re.search(ln):
-                if re.search(r"benefici[aá]rio|cedente|sacador|avalista", ln, re.IGNORECASE):
+                if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
                     continue
                 nome = cnpj_re.split(ln)[0].strip()
-                if nome:
+                if nome and not _nome_boleto_parece_invalido(nome):
                     pagador = _normalizar_nome_arquivo(nome)
                     break
 
@@ -507,6 +577,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
         beneficiario = re.sub(r"\s+\d{2}/\d{2}/\d{4}.*$", "", beneficiario)
         beneficiario = re.sub(r"\s+\d{8}.*$", "", beneficiario)
         beneficiario = re.sub(r"\s+R\$\s*[\d\.,]+.*$", "", beneficiario)
+        beneficiario = re.sub(r"\s+R\$\s*$", "", beneficiario)
 
     m_benef_cnpj = re.search(
         r"CPF/CNPJ Benefici[aá]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
@@ -1152,9 +1223,25 @@ def processar_boletos(
         info_boleto = _extrair_info_boleto_pdf(caminho, log=log)
         pagador = (info_boleto.get("pagador") or "").strip()
         beneficiario = (info_boleto.get("beneficiario") or "").strip()
-        if not pagador or not beneficiario:
+        erros_extracao = []
+        if not pagador:
+            erros_extracao.append("pagador_vazio")
+        elif _nome_boleto_parece_invalido(pagador):
+            erros_extracao.append(f"pagador_invalido={pagador}")
+        if not beneficiario:
+            erros_extracao.append("beneficiario_vazio")
+        elif _nome_boleto_parece_invalido(beneficiario):
+            erros_extracao.append(f"beneficiario_invalido={beneficiario}")
+        if pagador and beneficiario and _texto_compacto(pagador) == _texto_compacto(beneficiario):
+            erros_extracao.append("pagador_igual_beneficiario")
+        if pagador and texto_mva and _texto_compacto(texto_mva) in _texto_compacto(pagador):
+            erros_extracao.append("pagador_com_nome_mva")
+        if pagador and texto_horizonte and _texto_compacto(texto_horizonte) in _texto_compacto(pagador):
+            erros_extracao.append("pagador_com_nome_horizonte")
+        if erros_extracao:
+            log(f"Boleto ignorado por falha de extração ({caminho.name}): {'; '.join(erros_extracao)}")
             if debug_log:
-                debug_log(f"[BOLETO] Ignorado (pagador/beneficiario vazio): {caminho}")
+                debug_log(f"[BOLETO] Ignorado (falha extracao): {caminho} | {'; '.join(erros_extracao)}")
             cache[cache_key] = agora
             continue
         benef = (info_boleto.get("beneficiario") or "").lower()
