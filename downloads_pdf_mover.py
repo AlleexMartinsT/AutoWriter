@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -1402,15 +1402,18 @@ def _coletar_eventos_existentes_mes_atual(
 ) -> list[dict]:
     eventos = []
 
-    def pasta_mes_atual(base: Path) -> Path:
+    def pasta_ano_atual(base: Path) -> Path:
         hoje = datetime.now()
-        return base / hoje.strftime("%Y") / MESES[hoje.month - 1]
+        return base / hoje.strftime("%Y")
 
     for base in destinos_pdf:
-        pasta = pasta_mes_atual(base)
+        pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
-        for p in pasta.glob("*.pdf"):
+        # PDFs ficam em subpastas de mês; varre o ano inteiro para compor trio entre meses.
+        for p in pasta.rglob("*.pdf"):
+            if not p.is_file():
+                continue
             nf = _extrair_nf_do_nome(p.name)
             if nf:
                 eventos.append({"tipo": "pdf", "path": p, "nf": nf})
@@ -1430,10 +1433,13 @@ def _coletar_eventos_existentes_mes_atual(
                 eventos.append({"tipo": "boleto", "path": p, "nf": nf})
 
     for base in destinos_xml:
-        pasta = pasta_mes_atual(base)
+        pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
-        for p in pasta.glob("*.xml"):
+        # XMLs também ficam em subpastas de mês.
+        for p in pasta.rglob("*.xml"):
+            if not p.is_file():
+                continue
             nf = _extrair_nf_do_nome(p.name)
             if not nf:
                 txt = _ler_texto_arquivo(p) or ""
