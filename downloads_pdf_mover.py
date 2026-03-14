@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.9"
+APP_VERSION = "1.1.10"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -83,7 +83,9 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
     path = _config_path(base_dir)
     if path.exists():
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            # Some editors/OSes may write a UTF-8 BOM (Byte Order Mark) at the start.
+            # Using "utf-8-sig" makes json.loads tolerant to a BOM.
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
             if isinstance(raw, dict):
                 for k in cfg:
                     v = raw.get(k)
@@ -840,13 +842,14 @@ def _template_path(base_dir: Path) -> Path:
     return bundled if bundled.exists() else local
 
 
+# Sessão Criador de Email
 def _montar_corpo_email(base_dir: Path, nf: str) -> str:
     path = _template_path(base_dir)
     if path.exists():
         txt = path.read_text(encoding="utf-8", errors="ignore")
     else:
         txt = "Boa tarde!!!\n\nSegue em anexo XML PDF NF{NF} + BOLETO\n\n***Favor confirmar e-mail***\nAtt"
-    txt = re.sub(r"NF\s*\d+", f"NF{nf}", txt, flags=re.IGNORECASE)
+    txt = re.sub(r"\{NF\}", nf, txt, flags=re.IGNORECASE)
     if f"NF{nf}" not in txt:
         txt += f"\n\nNF{nf}"
     return txt
