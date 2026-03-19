@@ -78,6 +78,56 @@ def _viewer_settings_path(base_dir: Path) -> Path:
     return Path(os.getenv("PDF_VIEWER_SETTINGS_PATH", str(appdata / "PdfWatcher" / "viewer_settings.json")))
 
 
+def _status_path(base_dir: Path) -> Path:
+    appdata = Path(os.getenv("APPDATA", str(base_dir)))
+    return Path(os.getenv("PDF_STATUS_PATH", str(appdata / "PdfWatcher" / "status.json")))
+
+
+def _status_padrao() -> dict[str, object]:
+    return {
+        "busy": False,
+        "phase": "Parado",
+        "detail": "Aguardando inicialização.",
+        "scan_interval_seconds": 2,
+        "last_cycle_seconds": 0.0,
+        "last_cycle_finished_at": "",
+        "last_existing_scan_seconds": 0.0,
+        "last_events_total": 0,
+        "last_pdf_events": 0,
+        "last_xml_events": 0,
+        "last_boleto_events": 0,
+        "updated_at": "",
+    }
+
+
+def _salvar_status(base_dir: Path, status: dict[str, object], log=print) -> None:
+    path = _status_path(base_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(_status_padrao())
+        payload.update(status or {})
+        payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.replace(path)
+    except Exception as e:
+        log(f"Falha ao salvar status '{path}': {e}")
+
+
+def _carregar_status(base_dir: Path, log=print) -> dict[str, object]:
+    path = _status_path(base_dir)
+    status = _status_padrao()
+    if not path.exists():
+        return status
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(raw, dict):
+            status.update(raw)
+    except Exception as e:
+        log(f"Falha ao ler status '{path}': {e}")
+    return status
+
+
 def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
     cfg = _default_paths(base_dir)
     path = _config_path(base_dir)
@@ -241,10 +291,38 @@ def _eh_pdf_valido(nome: str) -> bool:
     return not (n.endswith(".crdownload") or n.endswith(".part"))
 
 
+def _pdf_parece_boleto(nome: str, texto: str | None = None) -> bool:
+    nome_norm = _normalizar_nome_arquivo(nome).upper()
+    if "BOLETO" in nome_norm:
+        return True
+    if texto:
+        txt = texto.upper()
+        if _linha_digitavel_boleto(txt):
+            return True
+        sinais = (
+            "FICHA DE COMPENSACAO",
+            "NOSSO NUMERO",
+            "BENEFICIARIO",
+            "PAGADOR",
+            "REFERENTE A NF",
+        )
+        hits = sum(1 for sinal in sinais if sinal in txt)
+        if hits >= 3:
+            return True
+    return False
+
+
 def _arquivo_estavel(caminho: Path, intervalo: int = 1, tentativas: int = 3) -> bool:
     try:
         if not caminho.exists():
             return False
+        idade_minima = float(os.getenv("PDF_STABLE_AGE_SECONDS", "8"))
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+            if idade >= idade_minima:
+                return True
+        except Exception:
+            pass
         tamanho_anterior = caminho.stat().st_size
         for _ in range(tentativas):
             time.sleep(intervalo)
@@ -382,8 +460,9 @@ def _eh_boleto_valido(nome: str) -> bool:
     return Path(n).suffix == ".pdf"
 
 
-def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
-    texto = _extrair_texto_pdf(caminho, log=log) or ""
+def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None) -> dict[str, str | None]:
+    if texto is None:
+        texto = _extrair_texto_pdf(caminho, log=log) or ""
     if not texto.strip():
         return {
             "nf": _extrair_nf_do_nome(caminho.name),
@@ -581,6 +660,8 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print) -> dict[str, str | None]:
         # Evita telefone do SAC (0800...) sendo tratado como nosso número.
         if v.startswith("0800") and len(v) <= 11:
             return False
+        if "-" in valor:
+            return len(v) >= 5
         return len(v) >= 6
 
     def _escolher_melhor_nosso(candidatos: list[str]) -> str | None:
@@ -1171,14 +1252,17 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
             if debug_log:
                 debug_log(f"[PDF] Ignorado (arquivo instavel): {caminho}")
             continue
-        texto = None
-        if texto_mva or texto_horizonte:
-            texto = _extrair_texto_pdf(caminho, log=log)
-            if not texto:
-                if debug_log:
-                    debug_log(f"[PDF] Ignorado (sem texto PDF): {caminho}")
-                cache[cache_key] = agora
-                continue
+        texto = _extrair_texto_pdf(caminho, log=log)
+        if _pdf_parece_boleto(nome, texto):
+            if debug_log:
+                debug_log(f"[PDF] Ignorado (identificado como boleto): {caminho}")
+            cache[cache_key] = agora
+            continue
+        if (texto_mva or texto_horizonte) and not texto:
+            if debug_log:
+                debug_log(f"[PDF] Ignorado (sem texto PDF): {caminho}")
+            cache[cache_key] = agora
+            continue
         if texto_mva and texto and texto_mva.lower() in texto.lower():
             destino_dir = criar_pasta_data(destino_mva)
             novo_nome = _montar_nome_pdf(texto, log=log)
@@ -1270,7 +1354,14 @@ def processar_boletos(
                 debug_log(f"[BOLETO] Ignorado (arquivo instavel): {caminho}")
             continue
 
-        info_boleto = _extrair_info_boleto_pdf(caminho, log=log)
+        texto = _extrair_texto_pdf(caminho, log=log) or ""
+        if not _pdf_parece_boleto(nome, texto):
+            if debug_log:
+                debug_log(f"[BOLETO] Ignorado (nao parece boleto): {caminho}")
+            cache[cache_key] = agora
+            continue
+
+        info_boleto = _extrair_info_boleto_pdf(caminho, log=log, texto=texto)
         pagador = (info_boleto.get("pagador") or "").strip()
         beneficiario = (info_boleto.get("beneficiario") or "").strip()
         erros_extracao = []
@@ -1503,6 +1594,8 @@ def _criar_icone_tray():
 _config_window_lock = threading.Lock()
 _config_process = None
 _logs_process = None
+_status_process = None
+_update_process = None
 
 
 def _abrir_interface_config(base_dir: Path, log=print):
@@ -2101,6 +2194,192 @@ def _abrir_visualizador_logs_em_thread(base_dir: Path, log=print):
             log(f"Falha ao abrir visualizador de logs: {e}")
 
 
+def _abrir_status(base_dir: Path, log=print):
+    try:
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QVBoxLayout,
+            QLabel,
+            QHBoxLayout,
+            QPushButton,
+            QProgressBar,
+            QGridLayout,
+        )
+        from PySide6.QtCore import Qt, QTimer
+    except Exception as e:
+        log(f"PySide6 não encontrado para abrir status: {e}")
+        return
+
+    def _formatar_data_status(valor: str) -> str:
+        txt = (valor or "").strip()
+        if not txt:
+            return "—"
+        try:
+            return datetime.fromisoformat(txt).strftime("%d/%m/%Y %H:%M:%S")
+        except Exception:
+            return txt
+
+    app = QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QApplication(sys.argv)
+        created_app = True
+
+    dialog = QDialog()
+    dialog.setWindowTitle("PdfWatcher - Status")
+    dialog.setMinimumSize(620, 320)
+    dialog.setModal(False)
+    dialog.setStyleSheet("""
+        QDialog { background: #2a170f; color: #ffffff; }
+        QLabel { color: #ffffff; }
+        QLabel#title { font-size: 20px; font-weight: 700; color: #ff9f43; }
+        QLabel#subtitle { color: #ffd7b0; }
+        QLabel#value { color: #ffffff; font-weight: 600; }
+        QLabel#muted { color: #ffd7b0; }
+        QProgressBar {
+            background: #3a2418; border: 1px solid #b86a27; border-radius: 8px;
+            text-align: center; color: #ffffff; min-height: 18px;
+        }
+        QProgressBar::chunk { background: #ff8a1f; border-radius: 7px; }
+        QPushButton {
+            background: #ff8a1f; color: #ffffff; border: 0; border-radius: 8px;
+            padding: 8px 12px; font-weight: 600;
+        }
+        QPushButton.secondary { background: #4b2b1a; }
+        QPushButton:hover { background: #ff9f43; }
+        QPushButton:pressed { background: #cc6d12; padding-top: 9px; padding-left: 13px; }
+    """)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+
+    title = QLabel("Status do monitor")
+    title.setObjectName("title")
+    subtitle = QLabel("Acompanhe a etapa atual, o tempo do último ciclo e quando a pasta será analisada novamente.")
+    subtitle.setObjectName("subtitle")
+    subtitle.setWordWrap(True)
+    layout.addWidget(title)
+    layout.addWidget(subtitle)
+
+    progress = QProgressBar()
+    progress.setTextVisible(True)
+    progress.setRange(0, 100)
+    progress.setValue(0)
+    layout.addWidget(progress)
+
+    phase = QLabel("Parado")
+    phase.setObjectName("value")
+    detail = QLabel("Aguardando inicialização.")
+    detail.setWordWrap(True)
+    detail.setObjectName("muted")
+    layout.addWidget(phase)
+    layout.addWidget(detail)
+
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(14)
+    grid.setVerticalSpacing(8)
+    campos = {
+        "intervalo": QLabel("—"),
+        "ciclo": QLabel("—"),
+        "fim": QLabel("—"),
+        "historico": QLabel("—"),
+        "eventos": QLabel("—"),
+        "atualizado": QLabel("—"),
+    }
+    for lbl in campos.values():
+        lbl.setObjectName("value")
+
+    itens = [
+        ("Novo ciclo após", "intervalo"),
+        ("Último ciclo", "ciclo"),
+        ("Última conclusão", "fim"),
+        ("Varredura inicial", "historico"),
+        ("Últimos eventos", "eventos"),
+        ("Status atualizado em", "atualizado"),
+    ]
+    for idx, (texto, chave) in enumerate(itens):
+        lbl = QLabel(texto)
+        lbl.setObjectName("muted")
+        grid.addWidget(lbl, idx, 0)
+        grid.addWidget(campos[chave], idx, 1)
+    grid.setColumnStretch(1, 1)
+    layout.addLayout(grid)
+
+    actions = QHBoxLayout()
+    btn_refresh = QPushButton("Atualizar")
+    btn_logs = QPushButton("Ver logs")
+    btn_logs.setProperty("class", "secondary")
+    btn_close = QPushButton("Fechar")
+    btn_close.setProperty("class", "secondary")
+    actions.addWidget(btn_refresh)
+    actions.addWidget(btn_logs)
+    actions.addStretch(1)
+    actions.addWidget(btn_close)
+    layout.addLayout(actions)
+
+    def carregar():
+        status = _carregar_status(base_dir, log=log)
+        busy = bool(status.get("busy"))
+        if busy:
+            progress.setRange(0, 0)
+            progress.setFormat("Processando...")
+        else:
+            progress.setRange(0, 100)
+            progress.setValue(100)
+            progress.setFormat("Em espera")
+        phase.setText(str(status.get("phase") or "Parado"))
+        detail.setText(str(status.get("detail") or "Aguardando."))
+        intervalo = int(status.get("scan_interval_seconds") or 0)
+        campos["intervalo"].setText(f"{intervalo}s" if intervalo > 0 else "—")
+        ciclo = float(status.get("last_cycle_seconds") or 0.0)
+        campos["ciclo"].setText(f"{ciclo:.2f}s" if ciclo > 0 else "—")
+        historico = float(status.get("last_existing_scan_seconds") or 0.0)
+        campos["historico"].setText(f"{historico:.2f}s" if historico > 0 else "—")
+        campos["fim"].setText(_formatar_data_status(str(status.get("last_cycle_finished_at") or "")))
+        campos["atualizado"].setText(_formatar_data_status(str(status.get("updated_at") or "")))
+        eventos_txt = (
+            f"Total {int(status.get('last_events_total') or 0)} | "
+            f"PDF {int(status.get('last_pdf_events') or 0)} | "
+            f"XML {int(status.get('last_xml_events') or 0)} | "
+            f"Boleto {int(status.get('last_boleto_events') or 0)}"
+        )
+        campos["eventos"].setText(eventos_txt)
+
+    timer = QTimer(dialog)
+    timer.setInterval(900)
+    timer.timeout.connect(carregar)
+    timer.start()
+
+    btn_refresh.clicked.connect(carregar)
+    btn_logs.clicked.connect(lambda: _abrir_visualizador_logs_em_thread(base_dir, log=log))
+    btn_close.clicked.connect(dialog.close)
+    dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+    carregar()
+    dialog.exec()
+
+    if created_app:
+        app.quit()
+
+
+def _abrir_status_em_thread(base_dir: Path, log=print):
+    global _status_process
+    with _config_window_lock:
+        if _status_process and _status_process.poll() is None:
+            return
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--status"]
+                cwd = str(Path(sys.executable).parent)
+            else:
+                cmd = [sys.executable, str(Path(__file__).resolve()), "--status"]
+                cwd = str(base_dir)
+            _status_process = subprocess.Popen(cmd, cwd=cwd)
+        except Exception as e:
+            log(f"Falha ao abrir status: {e}")
+
+
 def _abrir_relatorio(base_dir: Path, log=print):
     try:
         from PySide6.QtWidgets import (
@@ -2233,6 +2512,8 @@ def _garantir_arquivos_iniciais(base_dir: Path, log=print) -> bool:
         p_log = _log_path(base_dir)
         p_log.parent.mkdir(parents=True, exist_ok=True)
         p_log.touch(exist_ok=True)
+        if not _status_path(base_dir).exists():
+            _salvar_status(base_dir, _status_padrao(), log=log)
     except Exception as e:
         log(f"Falha ao preparar arquivos iniciais: {e}")
     return first_run
@@ -2419,6 +2700,56 @@ def _verificar_atualizacao_github(
         return False
 
 
+def _verificar_atualizacao_manual(base_dir: Path, log=print) -> None:
+    try:
+        from PySide6.QtWidgets import QApplication
+    except Exception:
+        _verificar_atualizacao_github(
+            base_dir,
+            log=log,
+            prompt=True,
+            notify=True,
+            exit_on_success=True,
+            use_native_dialogs=False,
+        )
+        return
+
+    app = QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QApplication(sys.argv)
+        created_app = True
+    try:
+        _verificar_atualizacao_github(
+            base_dir,
+            log=log,
+            prompt=True,
+            notify=True,
+            exit_on_success=True,
+            use_native_dialogs=False,
+        )
+    finally:
+        if created_app:
+            app.quit()
+
+
+def _verificar_atualizacao_em_thread(base_dir: Path, log=print):
+    global _update_process
+    with _config_window_lock:
+        if _update_process and _update_process.poll() is None:
+            return
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--check-update"]
+                cwd = str(Path(sys.executable).parent)
+            else:
+                cmd = [sys.executable, str(Path(__file__).resolve()), "--check-update"]
+                cwd = str(base_dir)
+            _update_process = subprocess.Popen(cmd, cwd=cwd)
+        except Exception as e:
+            log(f"Falha ao abrir verificador de atualização: {e}")
+
+
 def _fluxo_primeira_execucao(base_dir: Path, log=print):
     first_run = not _config_path(base_dir).exists()
     if not first_run:
@@ -2532,8 +2863,22 @@ def _run_loop(stop_event: threading.Event, log):
     last_state_reload = time.time()
     last_update_check = 0.0
     update_interval = int(os.getenv("UPDATE_CHECK_INTERVAL", "3600"))
+    last_existing_scan_seconds = 0.0
+
+    def atualizar_status(phase: str, detail: str, busy: bool = True, **extra):
+        payload = {
+            "busy": busy,
+            "phase": phase,
+            "detail": detail,
+            "scan_interval_seconds": intervalo,
+            "last_existing_scan_seconds": last_existing_scan_seconds,
+        }
+        payload.update(extra)
+        _salvar_status(base_dir, payload, log=log)
 
     while not stop_event.is_set():
+        cycle_started_at = time.perf_counter()
+        atualizar_status("Lendo configuração", "Atualizando pastas observadas e preferências...", busy=True)
         cfg = _carregar_config(base_dir, log=log)
         origem_pdf = Path(cfg["pdf_watch_dir"])
         origem_xml = Path(cfg["xml_watch_dir"])
@@ -2588,6 +2933,8 @@ def _run_loop(stop_event: threading.Event, log):
             debug_ativo = debug_ativo_novo
             # Ao iniciar (ou ao trocar configuração), tenta compor trio PDF/XML/BOLETO
             # já existente nas pastas de destino do mês atual.
+            atualizar_status("Sincronizando histórico", "Lendo arquivos já existentes nas pastas de destino...", busy=True)
+            existing_scan_started = time.perf_counter()
             eventos.extend(
                 _coletar_eventos_existentes_mes_atual(
                     [destino_mva, destino_horizonte],
@@ -2596,6 +2943,7 @@ def _run_loop(stop_event: threading.Event, log):
                     log=log,
                 )
             )
+            last_existing_scan_seconds = round(time.perf_counter() - existing_scan_started, 3)
 
         if debug_log:
             def _count_dir(path: Path) -> int:
@@ -2608,6 +2956,7 @@ def _run_loop(stop_event: threading.Event, log):
             debug_log(f"[LOOP] origem XML itens: {_count_dir(origem_xml)}")
             debug_log(f"[LOOP] origem BOLETO itens: {_count_dir(origem_boleto)}")
 
+        atualizar_status("Analisando PDFs", f"Lendo PDFs em {origem_pdf}...", busy=True)
         if origem_pdf.exists():
             if permitir_todos or texto_mva or texto_horizonte:
                 eventos.extend(processar_pdfs(origem_pdf, destino_mva, destino_horizonte, nome_arquivo, padrao_regex, texto_mva, texto_horizonte, cache, log=log, debug_log=debug_log))
@@ -2619,6 +2968,7 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log(f"[PDF] Diretório não encontrado: {origem_pdf}")
 
+        atualizar_status("Analisando XMLs", f"Lendo XMLs em {origem_xml}...", busy=True)
         if origem_xml.exists():
             eventos.extend(processar_xmls(origem_xml, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log, debug_log=debug_log))
         else:
@@ -2629,6 +2979,7 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log(f"[XML] Diretório não encontrado: {origem_xml}")
 
+        atualizar_status("Analisando boletos", f"Lendo boletos em {origem_boleto}...", busy=True)
         if origem_boleto.exists():
             eventos.extend(
                 processar_boletos(
@@ -2651,6 +3002,7 @@ def _run_loop(stop_event: threading.Event, log):
                 debug_log(f"[BOLETO] Diretório não encontrado: {origem_boleto}")
 
         if time.time() - last_state_reload >= 300:
+            atualizar_status("Atualizando estado", "Relendo rascunhos, enviados e relatório...", busy=True)
             nfs_rascunho = _carregar_nfs_rascunho(base_dir, log=log)
             nfs_enviadas = _carregar_nfs_enviadas(base_dir, log=log)
             report_state = _carregar_report_state(base_dir, log=log)
@@ -2660,11 +3012,13 @@ def _run_loop(stop_event: threading.Event, log):
 
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
+            atualizar_status("Verificando atualização", "Consultando a versão mais recente...", busy=True)
             if _verificar_atualizacao_github(base_dir, log=log, prompt=False, notify=False):
                 log("Atualização iniciada. Encerrando o aplicativo...")
                 os._exit(0)
 
         if eventos:
+            atualizar_status("Criando rascunhos", "Compondo NFs prontas para envio...", busy=True)
             _tentar_criar_rascunhos(base_dir, gmail_service, eventos, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
             _salvar_report_state(base_dir, report_state, log=log)
         elif debug_log:
@@ -2673,6 +3027,27 @@ def _run_loop(stop_event: threading.Event, log):
         if cache:
             expira = time.time() - cache_ttl
             cache = {k: v for k, v in cache.items() if v >= expira}
+        pdf_events = sum(1 for ev in eventos if ev.get("tipo") == "pdf")
+        xml_events = sum(1 for ev in eventos if ev.get("tipo") == "xml")
+        boleto_events = sum(1 for ev in eventos if ev.get("tipo") == "boleto")
+        cycle_seconds = round(time.perf_counter() - cycle_started_at, 3)
+        atualizar_status(
+            "Aguardando",
+            f"Próxima varredura em {intervalo}s.",
+            busy=False,
+            last_cycle_seconds=cycle_seconds,
+            last_cycle_finished_at=datetime.now().isoformat(timespec="seconds"),
+            last_events_total=len(eventos),
+            last_pdf_events=pdf_events,
+            last_xml_events=xml_events,
+            last_boleto_events=boleto_events,
+        )
+        if eventos or cycle_seconds >= 5:
+            log(
+                f"Ciclo concluído em {cycle_seconds:.2f}s | "
+                f"PDF {pdf_events} | XML {xml_events} | BOLETO {boleto_events} | "
+                f"próxima varredura em {intervalo}s."
+            )
         stop_event.wait(intervalo)
 
 
@@ -2694,15 +3069,11 @@ def _run_tray():
     def on_logs(icon, item):
         _abrir_visualizador_logs_em_thread(base_dir, log=print)
 
+    def on_status(icon, item):
+        _abrir_status_em_thread(base_dir, log=print)
+
     def on_update(icon, item):
-        _verificar_atualizacao_github(
-            base_dir,
-            log=print,
-            prompt=True,
-            notify=True,
-            exit_on_success=True,
-            use_native_dialogs=True,
-        )
+        _verificar_atualizacao_em_thread(base_dir, log=print)
 
     def on_quit(icon, item):
         stop_event.set()
@@ -2710,6 +3081,7 @@ def _run_tray():
 
     menu = pystray.Menu(
         pystray.MenuItem("Configurar pastas", on_config),
+        pystray.MenuItem("Status", on_status),
         pystray.MenuItem("Ver logs", on_logs),
         pystray.MenuItem("Verificar atualização", on_update),
         pystray.MenuItem("Sair", on_quit),
@@ -2731,10 +3103,12 @@ def main():
     parser.add_argument("--no-tray", action="store_true", help="Roda no console, sem tray.")
     parser.add_argument("--config", action="store_true", help="Abre a interface de Configuração e sai.")
     parser.add_argument("--logs", action="store_true", help="Abre o visualizador de logs e sai.")
+    parser.add_argument("--status", action="store_true", help="Abre a janela de status e sai.")
+    parser.add_argument("--check-update", action="store_true", help="Abre a verificação manual de atualização e sai.")
     args = parser.parse_args()
     base_dir = _base_dir()
 
-    if not args.config and not args.logs:
+    if not args.config and not args.logs and not args.status and not args.check_update:
         if not _single_instance_guard():
             try:
                 from PySide6.QtWidgets import QMessageBox, QApplication
@@ -2750,6 +3124,12 @@ def main():
     elif args.logs:
         _garantir_arquivos_iniciais(base_dir, log=print)
         _abrir_visualizador_logs(base_dir, log=print)
+    elif args.status:
+        _garantir_arquivos_iniciais(base_dir, log=print)
+        _abrir_status(base_dir, log=print)
+    elif args.check_update:
+        _garantir_arquivos_iniciais(base_dir, log=print)
+        _verificar_atualizacao_manual(base_dir, log=print)
     elif args.no_tray:
         _fluxo_primeira_execucao(base_dir, log=print)
         _garantir_arquivos_iniciais(base_dir, log=print)
