@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2"
+APP_VERSION = "1.2.1"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -409,7 +409,7 @@ def _nome_boleto_parece_invalido(nome: str | None) -> bool:
         return True
     if re.search(r"\b(PAGADOR|BENEFICIARIO|CEDENTE|SACADOR|AVALISTA|NOSSO NUMERO|AGENCIA/CODIGO)\b", u):
         return True
-    if re.search(r"\b(ENDERECO|MUNICIPIO UF CEP|NUMERO DO DOCUMENTO|DADOS DO PAGADOR|FICHA DE COMPENSACAO|LOCAL DE PAGAMENTO|COOPERATIVA CONTRATANTE|AUTENTICACAO MECANICA)\b", u):
+    if re.search(r"\b(ENDERECO|MUNICIPIO UF CEP|NUMERO DO DOCUMENTO|DADOS DO PAGADOR|FICHA DE COMPENSACAO|LOCAL DE PAGAMENTO|COOPERATIVA CONTRATANTE|AUTENTICACAO MECANICA|RECIBO DO PAGADOR|ACOMPANHADO DO RECIBO|RECEBIMENTO|VALIDADE|DATA DO DOCUMENTO|USO DO BANCO|VALOR DOCUMENTO|VENCIMENTO|DESCONTO|ABATIMENTO|OUTRAS DEDUCOES|MORA|MULTA|OUTROS ACRESCIMOS|VALOR COBRADO)\b", u):
         return True
     if re.search(r"\b(NOTA FISCAL|CHAVE DE ACESSO|NFE REF|DANFE|EMISSAO)\b", u):
         return True
@@ -472,6 +472,8 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             "beneficiario_cnpj": None,
         }
 
+    texto_numeros = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", texto)
+
     m_nf = re.search(r"\bNF\s*0*([0-9]{1,12})\b", texto, re.IGNORECASE)
     nf = m_nf.group(1).lstrip("0") if m_nf else None
     if not nf:
@@ -501,9 +503,9 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             "SACADO",
             "NOME DO PAGADOR NUMERO DO DOCUMENTO",
             "ENDERECO",
-            "ENDEREÇO",
+            "ENDERE?O",
             "MUNICIPIO UF CEP",
-            "MUNICÍPIO UF CEP",
+            "MUNIC?PIO UF CEP",
             "MENSAGEM PAGADOR",
         }
         labels_pagador = (
@@ -524,12 +526,12 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                         nome_escolhido = p
                         break
                 nome = nome_escolhido if nome_escolhido else (partes[0] if partes else "")
-                # Eu removo possíveis traços ou dois-pontos que ficam no início / I remove leading dashes or colons
-                nome = nome.lstrip("-: ,;") 
+                nome = nome.lstrip("-: ,;")
 
             nome = re.sub(r"\s*-\s*CNPJ.*$", "", nome, flags=re.IGNORECASE).strip()
             nome = re.sub(r"\s+CNPJ[:\s].*$", "", nome, flags=re.IGNORECASE).strip()
             nome = re.sub(r"^(CNPJ|CPF)[\s:]*", "", nome, flags=re.IGNORECASE).strip()
+            nome = re.sub(rf"\b{re.escape(nf)}\b$", "", nome).strip(" -:;,.") if nf else nome
             return nome
 
         def _nome_parece_emitente(nome: str) -> bool:
@@ -542,7 +544,6 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
 
         candidato_emitente = None
 
-        # 1) Procurar bloco "Pagador" e usar a primeira linha útil abaixo dele.
         for i, ln in enumerate(linhas):
             if not ln:
                 continue
@@ -553,30 +554,43 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                     if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
                         if _nome_parece_emitente(nome):
                             candidato_emitente = candidato_emitente or nome
-                            continue
-                        return nome
-                for j in range(i + 1, min(i + 8, len(linhas))):
+                        else:
+                            return nome
+                for j in range(i + 1, min(i + 10, len(linhas))):
                     cand = linhas[j].strip()
                     if not cand:
                         continue
                     if cand.upper() in blacklist:
                         continue
-                    if re.search(r"benefici[aá]rio|cedente|sacador|avalista", cand, re.IGNORECASE):
+                    if re.search(r"benefici[a?]rio|cedente|sacador|avalista", cand, re.IGNORECASE):
                         break
                     nome = _limpar_nome_linha(cand)
-                    if nome and not _nome_boleto_parece_invalido(nome):
-                        if _nome_parece_emitente(nome):
-                            candidato_emitente = candidato_emitente or nome
-                            continue
-                        return nome
+                    if not nome or _nome_boleto_parece_invalido(nome):
+                        continue
+                    if _nome_parece_emitente(nome):
+                        candidato_emitente = candidato_emitente or nome
+                        continue
+                    return nome
 
-        # 2) Fallback: linha que contenha CNPJ e pareça nome do pagador.
+        if nf:
+            nf_rx = re.compile(rf"\b{re.escape(nf)}\b")
+            for ln in linhas:
+                if not ln or not nf_rx.search(ln):
+                    continue
+                nome = _limpar_nome_linha(re.sub(rf"\b{re.escape(nf)}\b.*$", "", ln).strip())
+                if not nome or _nome_boleto_parece_invalido(nome):
+                    continue
+                if _nome_parece_emitente(nome):
+                    candidato_emitente = candidato_emitente or nome
+                    continue
+                return nome
+
         for ln in linhas:
             if not ln or not cnpj_re.search(ln):
                 continue
             if _linha_digitavel_boleto(ln):
                 continue
-            if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
+            if re.search(r"benefici[a?]rio|cedente|sacador|avalista|ag[?e]ncia/c[o?]digo|nosso n[u?]mero", ln, re.IGNORECASE):
                 continue
             nome = _limpar_nome_linha(ln)
             if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
@@ -584,6 +598,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                     candidato_emitente = candidato_emitente or nome
                     continue
                 return nome
+
         if candidato_emitente:
             return candidato_emitente
         return None
@@ -598,7 +613,6 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                 return False
             return _texto_compacto(termo) in _texto_compacto(ln)
 
-        # 1) Prioriza linhas que contenham o nome esperado (MVA/HORIZONTE)
         for ln in linhas:
             if not ln:
                 continue
@@ -611,12 +625,12 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             "LOCAL DE PAGAMENTO",
             "DATA DO DOCUMENTO",
             "USO DO BANCO",
-            "INSTRUÇÕES (TEXTO DE RESPONSABILIDADE DO BENEFICIÁRIO)",
+            "INSTRU??ES (TEXTO DE RESPONSABILIDADE DO BENEFICI?RIO)",
             "PAGADOR",
-            "BENEFICIÁRIO FINAL",
-            "FICHA DE COMPENSAÇÃO",
+            "BENEFICI?RIO FINAL",
+            "FICHA DE COMPENSA??O",
             "VENCIMENTO",
-            "NOSSO NÚMERO",
+            "NOSSO N?MERO",
             "VALOR DOCUMENTO",
         }
 
@@ -625,13 +639,12 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                 return False
             if ln.upper() in blacklist:
                 return False
-            if re.search(r"benefici[aá]rio", ln, re.IGNORECASE):
+            if re.search(r"benefici[a?]rio", ln, re.IGNORECASE):
                 return False
             return not _nome_boleto_parece_invalido(ln)
 
-        # 2) Procurar bloco de beneficiário.
         for i, ln in enumerate(linhas):
-            if re.search(r"nome do benefici[aá]rio|\bbenefici[aá]rio\b", ln, re.IGNORECASE):
+            if re.search(r"nome do benefici[a?]rio|\bbenefici[a?]rio\b", ln, re.IGNORECASE):
                 for j in range(i + 1, min(i + 6, len(linhas))):
                     v = linhas[j].strip()
                     if not v:
@@ -654,7 +667,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             if _linha_digitavel_boleto(ln):
                 continue
             if cnpj_re.search(ln):
-                if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
+                if re.search(r"benefici[a?]rio|cedente|sacador|avalista|ag[?e]ncia/c[o?]digo|nosso n[u?]mero", ln, re.IGNORECASE):
                     continue
                 nome = cnpj_re.split(ln)[0].strip()
                 if nome and not _nome_boleto_parece_invalido(nome):
@@ -664,53 +677,58 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     def _nosso_valido(valor: str | None) -> bool:
         if not valor:
             return False
+        valor = valor.strip()
         v = re.sub(r"\D", "", valor)
         if not v:
             return False
-        # Evita telefone do SAC (0800...) sendo tratado como nosso número.
         if v.startswith("0800") and len(v) <= 11:
             return False
-        # I added this rule to ignore numbers starting with 000 / Eu adicionei esta regra para ignorar números que começam com 000
         if v.startswith("000"):
+            return False
+        if re.fullmatch(r"\d{5}-\d{3}", valor):
             return False
         if "-" in valor:
             return len(v) >= 5
         return len(v) >= 6
 
     def _escolher_melhor_nosso(candidatos: list[str]) -> str | None:
-        validos = [c for c in candidatos if _nosso_valido(c)]
+        validos = []
+        for cand in candidatos:
+            cand = cand.strip()
+            if not _nosso_valido(cand):
+                continue
+            validos.append(cand)
         if not validos:
             return None
-        # Prefere formato completo com hífen, depois o mais longo.
         validos.sort(key=lambda c: (1 if "-" in c else 0, len(re.sub(r"\D", "", c))), reverse=True)
         return validos[0]
 
     nosso_numero = None
-    # Caixa costuma trazer formato completo com hífen (ex.: 14000000178995139-1).
-    m_cx = re.findall(r"\b(\d{11,20}-\d{1,2})\b", texto)
+    m_cx = re.findall(r"\b(\d{11,20}-\d{1,2})\b", texto_numeros)
     nosso_numero = _escolher_melhor_nosso(m_cx)
     if not nosso_numero:
-        m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,120}?([0-9]{6,})", texto, re.IGNORECASE)
+        m_nosso = re.search(r"Nosso\s*n[u?]mero[\s\S]{0,180}?(\d{4,20}-\d{1,2}|\d{6,20})", texto_numeros, re.IGNORECASE)
         if m_nosso and _nosso_valido(m_nosso.group(1)):
             nosso_numero = m_nosso.group(1)
     if not nosso_numero:
-        linhas = [ln.strip() for ln in texto.splitlines()]
-        for i, ln in enumerate(linhas):
-            if re.search(r"Nosso\s*n[uú]mero", ln, re.IGNORECASE):
-                janela = " ".join(linhas[i:i+5])
-                cands = re.findall(r"\b(\d{4,}-?\d{0,2})\b", janela)
-                nosso_numero = _escolher_melhor_nosso(cands)
-                break
-    if not nosso_numero:
-        linhas = [ln.strip() for ln in texto.splitlines()]
-        for ln in linhas:
-            if nf and nf in ln and re.search(r"\bDM\b|\bN\b", ln):
-                cands = re.findall(r"\b(\d{4,}-\d{1,2})\b", ln)
+        linhas_num = [ln.strip() for ln in texto_numeros.splitlines()]
+        for i, ln in enumerate(linhas_num):
+            if re.search(r"Nosso\s*n[u?]mero", ln, re.IGNORECASE):
+                janela = " ".join(linhas_num[i:i+8])
+                cands = re.findall(r"\b(\d{4,20}-\d{1,2}|\d{6,20})\b", janela)
                 nosso_numero = _escolher_melhor_nosso(cands)
                 if nosso_numero:
                     break
     if not nosso_numero:
-        cands = re.findall(r"\b(\d{4,}-\d{1,2})\b", texto)
+        linhas_num = [ln.strip() for ln in texto_numeros.splitlines()]
+        for ln in linhas_num:
+            if nf and nf in ln and re.search(r"\bDM\b|\bDS\b|\bN\b", ln):
+                cands = re.findall(r"\b(\d{4,20}-\d{1,2})\b", ln)
+                nosso_numero = _escolher_melhor_nosso(cands)
+                if nosso_numero:
+                    break
+    if not nosso_numero:
+        cands = re.findall(r"\b(\d{4,20}-\d{1,2})\b", texto_numeros)
         nosso_numero = _escolher_melhor_nosso(cands)
 
     beneficiario = _extrair_beneficiario(texto)
@@ -722,7 +740,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
         beneficiario = re.sub(r"\s+R\$\s*$", "", beneficiario)
 
     m_benef_cnpj = re.search(
-        r"CPF/CNPJ Benefici[aá]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
+        r"CPF/CNPJ Benefici[a?]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
         texto,
         re.IGNORECASE | re.DOTALL,
     )
@@ -750,9 +768,14 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
     pagador_curto = " ".join(palavras[:2]).strip() if palavras else pagador_norm
     final_nosso = nosso_num
     if final_nosso:
-        # Mantém o formato completo quando vier com hífen (ex.: 7239-1, 14000000178980268-0).
-        # Só reduz para os últimos 4 dígitos quando não houver hífen.
-        if "-" not in final_nosso:
+        if "-" in final_nosso:
+            base, digito = final_nosso.rsplit("-", 1)
+            base_digits = re.sub(r"\D", "", base)
+            digito_digits = re.sub(r"\D", "", digito)
+            if base_digits and digito_digits:
+                base_final = base_digits[-4:] if len(base_digits) > 4 else base_digits
+                final_nosso = f"{base_final}-{digito_digits}"
+        else:
             final_nosso = final_nosso[-4:] if len(final_nosso) >= 4 else final_nosso
     sufixo = f" BLT {final_nosso}" if final_nosso else ""
     return f"BOLETO NF{nf} {pagador_curto}{sufixo}.pdf"
@@ -3118,16 +3141,97 @@ def _abrir_review_em_thread(base_dir: Path, log=print):
         except Exception as e:
             log(f"Falha ao abrir Revisão: {e}")
 
+def _extrair_ano_mes_pasta_review(pasta: Path) -> tuple[int, int]:
+    partes = [_normalizar_nome_arquivo(p).upper() for p in pasta.parts]
+    meses_mapa = {nome: i + 1 for i, nome in enumerate(MESES)}
+
+    for parte in reversed(partes):
+        m = re.fullmatch(r"(0[1-9]|1[0-2])-(20\d{2})", parte)
+        if m:
+            return int(m.group(2)), int(m.group(1))
+
+    for i in range(len(partes) - 1):
+        if re.fullmatch(r"20\d{2}", partes[i]) and partes[i + 1] in meses_mapa:
+            return int(partes[i]), meses_mapa[partes[i + 1]]
+
+    return 0, 0
+
+
+def _listar_pastas_review_boleto(base_dir: Path, log=print) -> list[dict[str, object]]:
+    cfg = _carregar_config(base_dir, log=lambda *a: None)
+    roots: list[tuple[str, Path]] = []
+
+    for label, key in (("MVA", "boleto_destino_mva"), ("HORIZONTE", "boleto_destino_horizonte")):
+        raw = (cfg.get(key) or "").strip()
+        if raw:
+            roots.append((label, Path(raw)))
+
+    if any(p.is_file() and p.name.upper().startswith("BOLETO NF") for p in base_dir.glob("*.pdf")):
+        roots.append(("WORKSPACE", base_dir))
+
+    entries = []
+    seen = set()
+
+    for source_label, root in roots:
+        if not root.exists():
+            continue
+
+        boleto_files = [
+            p for p in root.rglob("*.pdf")
+            if p.is_file() and p.name.upper().startswith("BOLETO NF")
+        ]
+        if not boleto_files:
+            continue
+
+        grouped: dict[Path, int] = {}
+        for pdf_file in boleto_files:
+            target_dir = pdf_file.parent
+            current = pdf_file.parent
+            while True:
+                year, month = _extrair_ano_mes_pasta_review(current)
+                if year or month:
+                    target_dir = current
+                    break
+                if current == root or current.parent == current:
+                    break
+                current = current.parent
+            grouped[target_dir] = grouped.get(target_dir, 0) + 1
+
+        for folder, count in grouped.items():
+            key = str(folder.resolve()) if folder.exists() else str(folder)
+            if key in seen:
+                continue
+            seen.add(key)
+            year, month = _extrair_ano_mes_pasta_review(folder)
+            try:
+                relative = folder.relative_to(root)
+                relative_text = str(relative) if str(relative) != "." else "raiz atual"
+            except Exception:
+                relative_text = folder.name
+            relative_text = relative_text.replace("\\", " / ")
+            entries.append({
+                "source": source_label,
+                "path": folder,
+                "count": count,
+                "year": year,
+                "month": month,
+                "label": f"{source_label} | {relative_text} | {count} boleto(s)",
+            })
+
+    entries.sort(key=lambda item: (item["year"], item["month"], item["count"], item["label"].lower()), reverse=True)
+    return entries
+
+
 def _abrir_review(base_dir: Path, log=print):
     try:
         from PySide6.QtWidgets import (
-            QApplication, QDialog, QVBoxLayout, QLabel, QHBoxLayout, 
-            QPushButton, QPlainTextEdit, QMessageBox
+            QApplication, QComboBox, QDialog, QFrame, QHBoxLayout, QLabel,
+            QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout
         )
         from PySide6.QtCore import Qt, QThread, Signal
         from PySide6.QtGui import QTextCursor
     except Exception as e:
-        log(f"PySide6 não encontrado: {e}")
+        log(f"PySide6 n?o encontrado: {e}")
         return
 
     app = QApplication.instance()
@@ -3137,129 +3241,192 @@ def _abrir_review(base_dir: Path, log=print):
         created_app = True
 
     dialog = QDialog()
-    dialog.setWindowTitle("PdfWatcher - Revisão Beatrice")
-    dialog.setMinimumSize(800, 500)
+    dialog.setWindowTitle("PdfWatcher - Revis?o Beatrice")
+    dialog.setMinimumSize(920, 620)
     dialog.setStyleSheet("""
-        QDialog { background: #1e1e1e; color: #ffffff; }
+        QDialog { background: #2a170f; color: #ffffff; }
         QLabel { color: #ffffff; }
-        QLabel#title { font-size: 20px; font-weight: 700; color: #3498db; }
+        QLabel#title { font-size: 22px; font-weight: 700; color: #ff9f43; }
+        QLabel#subtitle { color: #ffd7b0; }
+        QLabel#meta { color: #ffd7b0; }
+        QFrame#card {
+            background: #3a2418; border: 1px solid #b86a27; border-radius: 12px;
+        }
+        QComboBox {
+            background: #24150d; color: #ffffff; border: 1px solid #b86a27;
+            border-radius: 8px; padding: 8px 10px; min-height: 20px;
+        }
+        QComboBox:hover, QComboBox:focus { border: 1px solid #ff9f43; }
         QPlainTextEdit {
-            background: #2d2d2d; color: #ffffff; border: 1px solid #3498db;
-            border-radius: 8px; padding: 8px; font-family: Consolas, monospace;
+            background: #24150d; color: #ffffff; border: 1px solid #b86a27;
+            border-radius: 10px; padding: 10px; font-family: Consolas, monospace;
         }
         QPushButton {
-            background: #2980b9; color: #ffffff; border: 0; border-radius: 8px;
-            padding: 8px 12px; font-weight: 600;
+            background: #5a341d; color: #ffffff; border: 1px solid #b86a27;
+            border-radius: 8px; padding: 8px 12px; font-weight: 600;
         }
-        QPushButton.danger { background: #c0392b; }
-        QPushButton.warning { background: #d35400; }
-        QPushButton:hover { background: #3498db; }
-        QPushButton.danger:hover { background: #e74c3c; }
-        QPushButton.warning:hover { background: #e67e22; }
+        QPushButton:hover { background: #6a3d21; }
+        QPushButton:pressed { background: #4a2b16; }
+        QPushButton.primary { background: #ff8a1f; border: 0; }
+        QPushButton.primary:hover { background: #ff9f43; }
+        QPushButton.warning { background: #8a4b16; border: 0; }
+        QPushButton.warning:hover { background: #a85d1b; }
+        QPushButton.danger { background: #8c2f1f; border: 0; }
+        QPushButton.danger:hover { background: #a83a27; }
+        QMessageBox { background: #2a170f; color: #ffffff; }
+        QMessageBox QLabel { color: #ffffff; }
+        QMessageBox QPushButton {
+            background: #ff8a1f; color: #ffffff; border: 0; border-radius: 8px; padding: 6px 12px;
+        }
     """)
 
     layout = QVBoxLayout(dialog)
-    title = QLabel("Revisão Inteligente de Boletos (Beatrice)")
+    layout.setContentsMargins(22, 20, 22, 20)
+    layout.setSpacing(12)
+
+    title = QLabel("Revis?o Inteligente de Boletos (Beatrice)")
     title.setObjectName("title")
+    subtitle = QLabel(
+        "Escolha uma pasta da estrutura m?s/ano para revisar. "
+        "A Beatrice n?o reprocessa mais tudo automaticamente."
+    )
+    subtitle.setObjectName("subtitle")
     layout.addWidget(title)
+    layout.addWidget(subtitle)
+
+    selector_card = QFrame()
+    selector_card.setObjectName("card")
+    selector_layout = QVBoxLayout(selector_card)
+    selector_layout.setContentsMargins(14, 14, 14, 14)
+    selector_layout.setSpacing(8)
+
+    selector_label = QLabel("Pasta para revisar")
+    selector_label.setObjectName("meta")
+    folder_combo = QComboBox()
+    folder_path_label = QLabel()
+    folder_path_label.setWordWrap(True)
+    folder_path_label.setObjectName("meta")
+    folder_info_label = QLabel()
+    folder_info_label.setObjectName("meta")
+
+    selector_layout.addWidget(selector_label)
+    selector_layout.addWidget(folder_combo)
+    selector_layout.addWidget(folder_path_label)
+    selector_layout.addWidget(folder_info_label)
+    layout.addWidget(selector_card)
 
     text_log = QPlainTextEdit()
     text_log.setReadOnly(True)
-    text_log.setMaximumBlockCount(4000)
+    text_log.setMaximumBlockCount(5000)
     layout.addWidget(text_log, 1)
 
-    # Worker Thread para não travar a UI
     class ReviewWorker(QThread):
         log_signal = Signal(str)
         finished_signal = Signal()
-        
-        def __init__(self, base_dir):
+
+        def __init__(self, base_dir: Path, target_folder: Path):
             super().__init__()
             self.base_dir = base_dir
+            self.target_folder = target_folder
             self._is_running = True
 
         def stop(self):
             self._is_running = False
 
-        def _log(self, msg):
+        def _log(self, msg: str):
             self.log_signal.emit(msg)
 
         def run(self):
-            cfg = _carregar_config(self.base_dir, log=lambda *a: None)
-            destinos = [Path(cfg["boleto_destino_mva"]), Path(cfg["boleto_destino_horizonte"])]
-            
-            self._log("Iniciando varredura e reprocessamento...")
-            
-            hoje = datetime.now()
-            meses_ano = [f"{m:02d}-{hoje.year}" for m in range(max(1, hoje.month-2), hoje.month + 1)]
-            if not meses_ano:
-                meses_ano = [f"{hoje.month:02d}-{hoje.year}"]
-            
+            target_folder = self.target_folder
+            if not target_folder.exists():
+                self._log(f"ERRO: pasta n?o encontrada: {target_folder}")
+                self.finished_signal.emit()
+                return
+
+            arquivos = sorted(
+                p for p in target_folder.rglob("*.pdf")
+                if p.is_file() and p.name.upper().startswith("BOLETO NF")
+            )
+            self._log(f"Pasta selecionada: {target_folder}")
+            self._log(f"Boletos encontrados: {len(arquivos)}")
+
+            if not arquivos:
+                self._log("Nenhum boleto com prefixo 'BOLETO NF' foi encontrado nesta pasta.")
+                self.finished_signal.emit()
+                return
+
             history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
             batch = []
+            corrigidos = 0
+            avisos = 0
 
-            count = 0
+            for pdf_file in arquivos:
+                if not self._is_running:
+                    self._log("Interrup??o solicitada. Encerrando a revis?o atual...")
+                    break
 
-            for d in destinos:
-                if not d.exists(): continue
-                for subdir in d.iterdir():
-                    if not self._is_running: break
-                    if not subdir.is_dir(): continue
-                    if subdir.name not in meses_ano: continue
+                texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
+                info = _extrair_info_boleto_pdf(pdf_file, log=lambda *a: None, texto=texto)
+                novo_nome = _nomear_boleto(info, pdf_file.name)
 
-                    for pdf_file in subdir.rglob("*.pdf"):
-                        if not self._is_running: break
-                        if pdf_file.name.startswith("BOLETO NF"):
-                            texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
-                            info = _extrair_info_boleto_pdf(pdf_file, log=lambda *args: None, texto=texto)
-                            novo_nome = _nomear_boleto(info, pdf_file.name)
-                            
-                            # Cuidado para não comparar um vazio ou se pagador e nf faltam, a func devolve o fallback_nome
-                            if novo_nome != pdf_file.name:
-                                novo_caminho = pdf_file.parent / novo_nome
-                                if not novo_caminho.exists():
-                                    try:
-                                        shutil.move(str(pdf_file), str(novo_caminho))
-                                        self._log(f"✔ CORRIGIDO: {pdf_file.name} -> {novo_nome}")
-                                        # Pra desfazer de Path A para Path B. 'de' é sempre ondw ele esta agr (Path B), 'para' é o path antigo
-                                        batch.append({"de": str(novo_caminho), "para": str(pdf_file)})
-                                        count += 1
-                                    except Exception as e:
-                                        self._log(f"✖ ERRO ao mover {pdf_file.name}: {e}")
+                if not info.get("nosso_numero"):
+                    avisos += 1
+                    self._log(f"AVISO: n?mero do boleto n?o identificado em {pdf_file.name}")
+
+                if novo_nome == pdf_file.name:
+                    continue
+
+                novo_caminho = pdf_file.parent / novo_nome
+                if novo_caminho.exists():
+                    self._log(f"IGNORADO: destino j? existe para {pdf_file.name} -> {novo_nome}")
+                    continue
+
+                try:
+                    shutil.move(str(pdf_file), str(novo_caminho))
+                    batch.append({"de": str(novo_caminho), "para": str(pdf_file)})
+                    corrigidos += 1
+                    self._log(f"CORRIGIDO: {pdf_file.name} -> {novo_nome}")
+                except Exception as e:
+                    self._log(f"ERRO: n?o foi poss?vel mover {pdf_file.name}: {e}")
+
             if batch:
                 history.append({
                     "data_execucao": datetime.now().isoformat(timespec="seconds"),
-                    "acoes": batch
+                    "acoes": batch,
                 })
                 _salvar_undo_history(self.base_dir, history[-10:], log=lambda *a: None)
-                self._log(f"Finalizado. Total de {count} boletos corrigidos. Salvo no histórico de Desfazer.")
+
+            if corrigidos:
+                self._log(f"Finalizado. {corrigidos} boleto(s) foram corrigidos.")
             else:
-                self._log("Finalizado. Nenhum boleto necessitava de correção.")
-            
+                self._log("Finalizado. Nenhum boleto precisou ser corrigido.")
+            if avisos:
+                self._log(f"Avisos: {avisos} arquivo(s) ficaram sem n?mero identificado automaticamente.")
+
             self.finished_signal.emit()
 
     class UndoWorker(QThread):
         log_signal = Signal(str)
         finished_signal = Signal()
-        
-        def __init__(self, base_dir):
+
+        def __init__(self, base_dir: Path):
             super().__init__()
             self.base_dir = base_dir
 
-        def _log(self, msg):
+        def _log(self, msg: str):
             self.log_signal.emit(msg)
 
         def run(self):
             history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
             if not history:
-                self._log("Nenhum histórico para desfazer.")
+                self._log("Nenhum hist?rico para desfazer.")
                 self.finished_signal.emit()
                 return
-            
+
             last_batch = history.pop()
             acoes = last_batch.get("acoes", [])
-            self._log(f"Desfazendo lote do dia {last_batch.get('data_execucao')} com {len(acoes)} ações...")
-            
+            self._log(f"Desfazendo lote de {last_batch.get('data_execucao')} com {len(acoes)} a??o(?es)...")
+
             sucessos = 0
             for acao in acoes:
                 de = Path(acao["de"])
@@ -3267,77 +3434,133 @@ def _abrir_review(base_dir: Path, log=print):
                 if de.exists() and not para.exists():
                     try:
                         shutil.move(str(de), str(para))
-                        self._log(f"✔ DESFEITO: de {de.name} devolvido para {para.name}")
+                        self._log(f"DESFEITO: {de.name} voltou para {para.name}")
                         sucessos += 1
                     except Exception as e:
-                        self._log(f"✖ ERRO ao desfazer {de.name}: {e}")
+                        self._log(f"ERRO: falha ao desfazer {de.name}: {e}")
                 else:
-                    self._log(f"Ignorado: {de.name} não existe ou destino ocupado.")
-            
+                    self._log(f"IGNORADO: {de.name} n?o existe ou o destino j? est? ocupado.")
+
             _salvar_undo_history(self.base_dir, history, log=lambda *a: None)
-            self._log(f"Processo de Undo finalizado. {sucessos} ações revertidas.")
+            self._log(f"Undo finalizado. {sucessos} a??o(?es) revertidas.")
             self.finished_signal.emit()
 
     worker = None
+    folder_entries: list[dict[str, object]] = []
+
+    def append_log(texto: str):
+        text_log.appendPlainText(texto)
+        text_log.moveCursor(QTextCursor.End)
+
+    def current_entry() -> dict[str, object] | None:
+        idx = folder_combo.currentIndex()
+        if idx < 0 or idx >= len(folder_entries):
+            return None
+        return folder_entries[idx]
+
+    def refresh_folder_details():
+        entry = current_entry()
+        has_entry = entry is not None
+        btn_start.setEnabled(has_entry and (worker is None or not worker.isRunning()))
+        if not has_entry:
+            folder_path_label.setText("Nenhuma pasta de boletos encontrada na estrutura configurada.")
+            folder_info_label.setText("Revise a configura??o ou coloque os arquivos na pasta de destino correta.")
+            return
+        folder_path_label.setText(f"Pasta: {entry['path']}")
+        folder_info_label.setText(
+            f"Origem: {entry['source']} | Boletos detectados: {entry['count']}"
+        )
+
+    def reload_folders(preferred_path: str | None = None):
+        nonlocal folder_entries
+        folder_entries = _listar_pastas_review_boleto(base_dir, log=log)
+        folder_combo.blockSignals(True)
+        folder_combo.clear()
+        if folder_entries:
+            for entry in folder_entries:
+                folder_combo.addItem(entry['label'])
+            idx = 0
+            if preferred_path:
+                for i, entry in enumerate(folder_entries):
+                    if str(entry['path']) == preferred_path:
+                        idx = i
+                        break
+            folder_combo.setCurrentIndex(idx)
+        else:
+            folder_combo.addItem("Nenhuma pasta dispon?vel")
+        folder_combo.blockSignals(False)
+        refresh_folder_details()
+
+    def set_running_state(running: bool):
+        folder_combo.setEnabled(not running and bool(folder_entries))
+        btn_refresh.setEnabled(not running)
+        btn_start.setEnabled((not running) and bool(folder_entries))
+        btn_undo.setEnabled(not running)
 
     def on_start():
         nonlocal worker
+        entry = current_entry()
+        if entry is None:
+            QMessageBox.warning(dialog, "Revis?o", "Selecione uma pasta v?lida para revisar.")
+            return
+
         text_log.clear()
-        btn_start.setEnabled(False)
-        btn_undo.setEnabled(False)
-        worker = ReviewWorker(base_dir)
-        def append_log(t):
-            text_log.appendPlainText(t)
-            text_log.moveCursor(QTextCursor.End)
+        set_running_state(True)
+        worker = ReviewWorker(base_dir, Path(entry['path']))
         worker.log_signal.connect(append_log)
+
         def on_finished():
-            btn_start.setEnabled(True)
-            btn_undo.setEnabled(True)
+            set_running_state(False)
+
         worker.finished_signal.connect(on_finished)
         worker.start()
 
     def on_undo():
         nonlocal worker
         text_log.clear()
-        btn_start.setEnabled(False)
-        btn_undo.setEnabled(False)
+        set_running_state(True)
         worker = UndoWorker(base_dir)
-        def append_log(t):
-            text_log.appendPlainText(t)
-            text_log.moveCursor(QTextCursor.End)
         worker.log_signal.connect(append_log)
+
         def on_finished():
-            btn_start.setEnabled(True)
-            btn_undo.setEnabled(True)
+            set_running_state(False)
+            reload_folders(str(current_entry()['path']) if current_entry() else None)
+
         worker.finished_signal.connect(on_finished)
         worker.start()
 
     def on_stop():
         if worker and isinstance(worker, ReviewWorker):
             worker.stop()
-            text_log.appendPlainText("⚠ Interrompendo varredura, aguarde...")
+            append_log("Interrompendo a revis?o atual, aguarde...")
 
     actions = QHBoxLayout()
-    btn_start = QPushButton("▶ Iniciar Revisão")
-    btn_stop = QPushButton("⏸ Parar")
-    btn_stop.setProperty("class", "danger")
-    btn_undo = QPushButton("↩ Desfazer última revisão")
+    btn_start = QPushButton("Iniciar revis?o")
+    btn_start.setProperty("class", "primary")
+    btn_refresh = QPushButton("Atualizar lista")
+    btn_undo = QPushButton("Desfazer ?ltima revis?o")
     btn_undo.setProperty("class", "warning")
+    btn_stop = QPushButton("Parar")
+    btn_stop.setProperty("class", "danger")
+    btn_close = QPushButton("Fechar")
 
     btn_start.clicked.connect(on_start)
-    btn_stop.clicked.connect(on_stop)
+    btn_refresh.clicked.connect(lambda: reload_folders(str(current_entry()['path']) if current_entry() else None))
     btn_undo.clicked.connect(on_undo)
+    btn_stop.clicked.connect(on_stop)
+    btn_close.clicked.connect(dialog.reject)
+    folder_combo.currentIndexChanged.connect(refresh_folder_details)
 
     actions.addWidget(btn_start)
-    actions.addWidget(btn_stop)
+    actions.addWidget(btn_refresh)
     actions.addWidget(btn_undo)
+    actions.addWidget(btn_stop)
     actions.addStretch(1)
-
-    btn_fechar = QPushButton("Fechar")
-    btn_fechar.clicked.connect(dialog.reject)
-    actions.addWidget(btn_fechar)
-
+    actions.addWidget(btn_close)
     layout.addLayout(actions)
+
+    reload_folders()
+    dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     dialog.exec()
 
     if created_app:
