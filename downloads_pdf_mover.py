@@ -1,4 +1,4 @@
-﻿import os
+import os
 import time
 import shutil
 import re
@@ -659,6 +659,9 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             return False
         # Evita telefone do SAC (0800...) sendo tratado como nosso número.
         if v.startswith("0800") and len(v) <= 11:
+            return False
+        # I added this rule to ignore numbers starting with 000 / Eu adicionei esta regra para ignorar números que começam com 000
+        if v.startswith("000"):
             return False
         if "-" in valor:
             return len(v) >= 5
