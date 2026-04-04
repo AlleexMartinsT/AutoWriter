@@ -3061,7 +3061,275 @@ def _run_loop(stop_event: threading.Event, log):
                 f"PDF {pdf_events} | XML {xml_events} | BOLETO {boleto_events} | "
                 f"próxima varredura em {intervalo}s."
             )
-        stop_event.wait(intervalo)
+
+# Lógica da Beatrice Review
+
+def _undo_history_path(base_dir: Path) -> Path:
+    appdata = Path(os.getenv("APPDATA", str(base_dir)))
+    return Path(os.getenv("PDF_UNDO_PATH", str(appdata / "PdfWatcher" / "undo_history.json")))
+
+def _carregar_undo_history(base_dir: Path, log=print) -> list:
+    path = _undo_history_path(base_dir)
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, list):
+                return raw
+        except Exception as e:
+            log(f"Falha ao ler histórico de undo: {e}")
+    return []
+
+def _salvar_undo_history(base_dir: Path, history: list, log=print):
+    path = _undo_history_path(base_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        log(f"Falha ao salvar histórico de undo: {e}")
+
+_review_process = None
+_review_window_lock = threading.Lock()
+
+def _abrir_review_em_thread(base_dir: Path, log=print):
+    global _review_process
+    with _review_window_lock:
+        if _review_process and _review_process.poll() is None:
+            return
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--review"]
+                cwd = str(Path(sys.executable).parent)
+            else:
+                cmd = [sys.executable, str(Path(__file__).resolve()), "--review"]
+                cwd = str(base_dir)
+            _review_process = subprocess.Popen(cmd, cwd=cwd)
+        except Exception as e:
+            log(f"Falha ao abrir Revisão: {e}")
+
+def _abrir_review(base_dir: Path, log=print):
+    try:
+        from PySide6.QtWidgets import (
+            QApplication, QDialog, QVBoxLayout, QLabel, QHBoxLayout, 
+            QPushButton, QPlainTextEdit, QMessageBox
+        )
+        from PySide6.QtCore import Qt, QThread, Signal
+        from PySide6.QtGui import QTextCursor
+    except Exception as e:
+        log(f"PySide6 não encontrado: {e}")
+        return
+
+    app = QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QApplication(sys.argv)
+        created_app = True
+
+    dialog = QDialog()
+    dialog.setWindowTitle("PdfWatcher - Revisão Beatrice")
+    dialog.setMinimumSize(800, 500)
+    dialog.setStyleSheet("""
+        QDialog { background: #1e1e1e; color: #ffffff; }
+        QLabel { color: #ffffff; }
+        QLabel#title { font-size: 20px; font-weight: 700; color: #3498db; }
+        QPlainTextEdit {
+            background: #2d2d2d; color: #ffffff; border: 1px solid #3498db;
+            border-radius: 8px; padding: 8px; font-family: Consolas, monospace;
+        }
+        QPushButton {
+            background: #2980b9; color: #ffffff; border: 0; border-radius: 8px;
+            padding: 8px 12px; font-weight: 600;
+        }
+        QPushButton.danger { background: #c0392b; }
+        QPushButton.warning { background: #d35400; }
+        QPushButton:hover { background: #3498db; }
+        QPushButton.danger:hover { background: #e74c3c; }
+        QPushButton.warning:hover { background: #e67e22; }
+    """)
+
+    layout = QVBoxLayout(dialog)
+    title = QLabel("Revisão Inteligente de Boletos (Beatrice)")
+    title.setObjectName("title")
+    layout.addWidget(title)
+
+    text_log = QPlainTextEdit()
+    text_log.setReadOnly(True)
+    text_log.setMaximumBlockCount(4000)
+    layout.addWidget(text_log, 1)
+
+    # Worker Thread para não travar a UI
+    class ReviewWorker(QThread):
+        log_signal = Signal(str)
+        finished_signal = Signal()
+        
+        def __init__(self, base_dir):
+            super().__init__()
+            self.base_dir = base_dir
+            self._is_running = True
+
+        def stop(self):
+            self._is_running = False
+
+        def _log(self, msg):
+            self.log_signal.emit(msg)
+
+        def run(self):
+            cfg = _carregar_config(self.base_dir, log=lambda *a: None)
+            destinos = [Path(cfg["boleto_destino_mva"]), Path(cfg["boleto_destino_horizonte"])]
+            
+            self._log("Iniciando varredura e reprocessamento...")
+            
+            hoje = datetime.now()
+            meses_ano = [f"{m:02d}-{hoje.year}" for m in range(max(1, hoje.month-2), hoje.month + 1)]
+            if not meses_ano:
+                meses_ano = [f"{hoje.month:02d}-{hoje.year}"]
+            
+            history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
+            batch = []
+
+            count = 0
+
+            for d in destinos:
+                if not d.exists(): continue
+                for subdir in d.iterdir():
+                    if not self._is_running: break
+                    if not subdir.is_dir(): continue
+                    if subdir.name not in meses_ano: continue
+
+                    for pdf_file in subdir.rglob("*.pdf"):
+                        if not self._is_running: break
+                        if pdf_file.name.startswith("BOLETO NF"):
+                            texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
+                            info = _extrair_info_boleto_pdf(pdf_file, log=lambda *args: None, texto=texto)
+                            novo_nome = _nomear_boleto(info, pdf_file.name)
+                            
+                            # Cuidado para não comparar um vazio ou se pagador e nf faltam, a func devolve o fallback_nome
+                            if novo_nome != pdf_file.name:
+                                novo_caminho = pdf_file.parent / novo_nome
+                                if not novo_caminho.exists():
+                                    try:
+                                        shutil.move(str(pdf_file), str(novo_caminho))
+                                        self._log(f"✔ CORRIGIDO: {pdf_file.name} -> {novo_nome}")
+                                        # Pra desfazer de Path A para Path B. 'de' é sempre ondw ele esta agr (Path B), 'para' é o path antigo
+                                        batch.append({"de": str(novo_caminho), "para": str(pdf_file)})
+                                        count += 1
+                                    except Exception as e:
+                                        self._log(f"✖ ERRO ao mover {pdf_file.name}: {e}")
+            if batch:
+                history.append({
+                    "data_execucao": datetime.now().isoformat(timespec="seconds"),
+                    "acoes": batch
+                })
+                _salvar_undo_history(self.base_dir, history[-10:], log=lambda *a: None)
+                self._log(f"Finalizado. Total de {count} boletos corrigidos. Salvo no histórico de Desfazer.")
+            else:
+                self._log("Finalizado. Nenhum boleto necessitava de correção.")
+            
+            self.finished_signal.emit()
+
+    class UndoWorker(QThread):
+        log_signal = Signal(str)
+        finished_signal = Signal()
+        
+        def __init__(self, base_dir):
+            super().__init__()
+            self.base_dir = base_dir
+
+        def _log(self, msg):
+            self.log_signal.emit(msg)
+
+        def run(self):
+            history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
+            if not history:
+                self._log("Nenhum histórico para desfazer.")
+                self.finished_signal.emit()
+                return
+            
+            last_batch = history.pop()
+            acoes = last_batch.get("acoes", [])
+            self._log(f"Desfazendo lote do dia {last_batch.get('data_execucao')} com {len(acoes)} ações...")
+            
+            sucessos = 0
+            for acao in acoes:
+                de = Path(acao["de"])
+                para = Path(acao["para"])
+                if de.exists() and not para.exists():
+                    try:
+                        shutil.move(str(de), str(para))
+                        self._log(f"✔ DESFEITO: de {de.name} devolvido para {para.name}")
+                        sucessos += 1
+                    except Exception as e:
+                        self._log(f"✖ ERRO ao desfazer {de.name}: {e}")
+                else:
+                    self._log(f"Ignorado: {de.name} não existe ou destino ocupado.")
+            
+            _salvar_undo_history(self.base_dir, history, log=lambda *a: None)
+            self._log(f"Processo de Undo finalizado. {sucessos} ações revertidas.")
+            self.finished_signal.emit()
+
+    worker = None
+
+    def on_start():
+        nonlocal worker
+        text_log.clear()
+        btn_start.setEnabled(False)
+        btn_undo.setEnabled(False)
+        worker = ReviewWorker(base_dir)
+        def append_log(t):
+            text_log.appendPlainText(t)
+            text_log.moveCursor(QTextCursor.End)
+        worker.log_signal.connect(append_log)
+        def on_finished():
+            btn_start.setEnabled(True)
+            btn_undo.setEnabled(True)
+        worker.finished_signal.connect(on_finished)
+        worker.start()
+
+    def on_undo():
+        nonlocal worker
+        text_log.clear()
+        btn_start.setEnabled(False)
+        btn_undo.setEnabled(False)
+        worker = UndoWorker(base_dir)
+        def append_log(t):
+            text_log.appendPlainText(t)
+            text_log.moveCursor(QTextCursor.End)
+        worker.log_signal.connect(append_log)
+        def on_finished():
+            btn_start.setEnabled(True)
+            btn_undo.setEnabled(True)
+        worker.finished_signal.connect(on_finished)
+        worker.start()
+
+    def on_stop():
+        if worker and isinstance(worker, ReviewWorker):
+            worker.stop()
+            text_log.appendPlainText("⚠ Interrompendo varredura, aguarde...")
+
+    actions = QHBoxLayout()
+    btn_start = QPushButton("▶ Iniciar Revisão")
+    btn_stop = QPushButton("⏸ Parar")
+    btn_stop.setProperty("class", "danger")
+    btn_undo = QPushButton("↩ Desfazer última revisão")
+    btn_undo.setProperty("class", "warning")
+
+    btn_start.clicked.connect(on_start)
+    btn_stop.clicked.connect(on_stop)
+    btn_undo.clicked.connect(on_undo)
+
+    actions.addWidget(btn_start)
+    actions.addWidget(btn_stop)
+    actions.addWidget(btn_undo)
+    actions.addStretch(1)
+
+    btn_fechar = QPushButton("Fechar")
+    btn_fechar.clicked.connect(dialog.reject)
+    actions.addWidget(btn_fechar)
+
+    layout.addLayout(actions)
+    dialog.exec()
+
+    if created_app:
+        app.quit()
 
 
 def _run_tray():
@@ -3088,12 +3356,16 @@ def _run_tray():
     def on_update(icon, item):
         _verificar_atualizacao_em_thread(base_dir, log=print)
 
+    def on_review(icon, item):
+        _abrir_review_em_thread(base_dir, log=print)
+
     def on_quit(icon, item):
         stop_event.set()
         icon.stop()
 
     menu = pystray.Menu(
         pystray.MenuItem("Configurar pastas", on_config),
+        pystray.MenuItem("Revisão de Boletos (Beatrice)", on_review),
         pystray.MenuItem("Status", on_status),
         pystray.MenuItem("Ver logs", on_logs),
         pystray.MenuItem("Verificar atualização", on_update),
@@ -3117,11 +3389,12 @@ def main():
     parser.add_argument("--config", action="store_true", help="Abre a interface de Configuração e sai.")
     parser.add_argument("--logs", action="store_true", help="Abre o visualizador de logs e sai.")
     parser.add_argument("--status", action="store_true", help="Abre a janela de status e sai.")
+    parser.add_argument("--review", action="store_true", help="Abre a interface de revisão de boletos.")
     parser.add_argument("--check-update", action="store_true", help="Abre a verificação manual de atualização e sai.")
     args = parser.parse_args()
     base_dir = _base_dir()
 
-    if not args.config and not args.logs and not args.status and not args.check_update:
+    if not args.config and not args.logs and not args.status and not args.check_update and not args.review:
         if not _single_instance_guard():
             try:
                 from PySide6.QtWidgets import QMessageBox, QApplication
@@ -3140,6 +3413,9 @@ def main():
     elif args.status:
         _garantir_arquivos_iniciais(base_dir, log=print)
         _abrir_status(base_dir, log=print)
+    elif args.review:
+        _garantir_arquivos_iniciais(base_dir, log=print)
+        _abrir_review(base_dir, log=print)
     elif args.check_update:
         _garantir_arquivos_iniciais(base_dir, log=print)
         _verificar_atualizacao_manual(base_dir, log=print)
