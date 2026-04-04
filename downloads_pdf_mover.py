@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.13"
+APP_VERSION = "1.2"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -2532,18 +2532,17 @@ def _garantir_arquivos_iniciais(base_dir: Path, log=print) -> bool:
     return first_run
 
 
-def _parse_version(tag: str) -> tuple[int, int, int]:
+def _parse_version(tag: str) -> tuple[int, ...]:
     tag = (tag or "").strip().lstrip("vV")
-    parts = tag.split(".")
+    if not tag:
+        return (0,)
     nums = []
-    for p in parts[:3]:
-        try:
-            nums.append(int(re.sub(r"[^0-9]", "", p)))
-        except Exception:
-            nums.append(0)
-    while len(nums) < 3:
-        nums.append(0)
-    return tuple(nums[:3])
+    for part in tag.split("."):
+        digits = re.sub(r"[^0-9]", "", part)
+        nums.append(int(digits) if digits else 0)
+    while len(nums) > 1 and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums or [0])
 
 
 def _notificar_usuario_atualizacao(titulo: str, mensagem: str, prefer_native: bool = False) -> None:
