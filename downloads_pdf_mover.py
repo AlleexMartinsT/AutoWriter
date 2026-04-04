@@ -517,9 +517,19 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
         def _limpar_nome_linha(ln: str) -> str:
             nome = ln.strip()
             if cnpj_re.search(nome):
-                nome = cnpj_re.split(nome)[0].strip()
+                partes = [p.strip() for p in cnpj_re.split(nome) if p.strip()]
+                nome_escolhido = ""
+                for p in partes:
+                    if re.search(r'[A-Za-z]', p):
+                        nome_escolhido = p
+                        break
+                nome = nome_escolhido if nome_escolhido else (partes[0] if partes else "")
+                # Eu removo possíveis traços ou dois-pontos que ficam no início / I remove leading dashes or colons
+                nome = nome.lstrip("-: ,;") 
+
             nome = re.sub(r"\s*-\s*CNPJ.*$", "", nome, flags=re.IGNORECASE).strip()
             nome = re.sub(r"\s+CNPJ[:\s].*$", "", nome, flags=re.IGNORECASE).strip()
+            nome = re.sub(r"^(CNPJ|CPF)[\s:]*", "", nome, flags=re.IGNORECASE).strip()
             return nome
 
         def _nome_parece_emitente(nome: str) -> bool:
