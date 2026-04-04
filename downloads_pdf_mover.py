@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -503,9 +503,9 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             "SACADO",
             "NOME DO PAGADOR NUMERO DO DOCUMENTO",
             "ENDERECO",
-            "ENDERE?O",
+            "ENDEREÇO",
             "MUNICIPIO UF CEP",
-            "MUNIC?PIO UF CEP",
+            "MUNICÍPIO UF CEP",
             "MENSAGEM PAGADOR",
         }
         labels_pagador = (
@@ -562,7 +562,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                         continue
                     if cand.upper() in blacklist:
                         continue
-                    if re.search(r"benefici[a?]rio|cedente|sacador|avalista", cand, re.IGNORECASE):
+                    if re.search(r"benefici[aá]rio|cedente|sacador|avalista", cand, re.IGNORECASE):
                         break
                     nome = _limpar_nome_linha(cand)
                     if not nome or _nome_boleto_parece_invalido(nome):
@@ -590,7 +590,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                 continue
             if _linha_digitavel_boleto(ln):
                 continue
-            if re.search(r"benefici[a?]rio|cedente|sacador|avalista|ag[?e]ncia/c[o?]digo|nosso n[u?]mero", ln, re.IGNORECASE):
+            if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
                 continue
             nome = _limpar_nome_linha(ln)
             if nome and nome.upper() not in blacklist and not _nome_boleto_parece_invalido(nome):
@@ -625,12 +625,16 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             "LOCAL DE PAGAMENTO",
             "DATA DO DOCUMENTO",
             "USO DO BANCO",
-            "INSTRU??ES (TEXTO DE RESPONSABILIDADE DO BENEFICI?RIO)",
+            "INSTRUCOES (TEXTO DE RESPONSABILIDADE DO BENEFICIARIO)",
+            "INSTRUÇÕES (TEXTO DE RESPONSABILIDADE DO BENEFICIÁRIO)",
             "PAGADOR",
+            "BENEFICIARIO FINAL",
             "BENEFICI?RIO FINAL",
-            "FICHA DE COMPENSA??O",
+            "FICHA DE COMPENSACAO",
+            "FICHA DE COMPENSAÇÃO",
             "VENCIMENTO",
-            "NOSSO N?MERO",
+            "NOSSO NUMERO",
+            "NOSSO NÚMERO",
             "VALOR DOCUMENTO",
         }
 
@@ -639,12 +643,12 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                 return False
             if ln.upper() in blacklist:
                 return False
-            if re.search(r"benefici[a?]rio", ln, re.IGNORECASE):
+            if re.search(r"benefici[aá]rio", ln, re.IGNORECASE):
                 return False
             return not _nome_boleto_parece_invalido(ln)
 
         for i, ln in enumerate(linhas):
-            if re.search(r"nome do benefici[a?]rio|\bbenefici[a?]rio\b", ln, re.IGNORECASE):
+            if re.search(r"nome do benefici[aá]rio|\bbenefici[aá]rio\b", ln, re.IGNORECASE):
                 for j in range(i + 1, min(i + 6, len(linhas))):
                     v = linhas[j].strip()
                     if not v:
@@ -667,14 +671,14 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             if _linha_digitavel_boleto(ln):
                 continue
             if cnpj_re.search(ln):
-                if re.search(r"benefici[a?]rio|cedente|sacador|avalista|ag[?e]ncia/c[o?]digo|nosso n[u?]mero", ln, re.IGNORECASE):
+                if re.search(r"benefici[aá]rio|cedente|sacador|avalista|ag[êe]ncia/c[oó]digo|nosso n[uú]mero", ln, re.IGNORECASE):
                     continue
                 nome = cnpj_re.split(ln)[0].strip()
                 if nome and not _nome_boleto_parece_invalido(nome):
                     pagador = _normalizar_nome_arquivo(nome)
                     break
 
-    def _nosso_valido(valor: str | None) -> bool:
+    def _nosso_valido(valor: str | None, allow_leading_zeros: bool = False) -> bool:
         if not valor:
             return False
         valor = valor.strip()
@@ -683,7 +687,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             return False
         if v.startswith("0800") and len(v) <= 11:
             return False
-        if v.startswith("000"):
+        if not allow_leading_zeros and v.startswith("000"):
             return False
         if re.fullmatch(r"\d{5}-\d{3}", valor):
             return False
@@ -691,11 +695,11 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             return len(v) >= 5
         return len(v) >= 6
 
-    def _escolher_melhor_nosso(candidatos: list[str]) -> str | None:
+    def _escolher_melhor_nosso(candidatos: list[str], allow_leading_zeros: bool = False) -> str | None:
         validos = []
         for cand in candidatos:
             cand = cand.strip()
-            if not _nosso_valido(cand):
+            if not _nosso_valido(cand, allow_leading_zeros=allow_leading_zeros):
                 continue
             validos.append(cand)
         if not validos:
@@ -707,16 +711,16 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     m_cx = re.findall(r"\b(\d{11,20}-\d{1,2})\b", texto_numeros)
     nosso_numero = _escolher_melhor_nosso(m_cx)
     if not nosso_numero:
-        m_nosso = re.search(r"Nosso\s*n[u?]mero[\s\S]{0,180}?(\d{4,20}-\d{1,2}|\d{6,20})", texto_numeros, re.IGNORECASE)
-        if m_nosso and _nosso_valido(m_nosso.group(1)):
+        m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,180}?(\d{4,20}-\d{1,2}|\d{6,20})", texto_numeros, re.IGNORECASE)
+        if m_nosso and _nosso_valido(m_nosso.group(1), allow_leading_zeros=True):
             nosso_numero = m_nosso.group(1)
     if not nosso_numero:
         linhas_num = [ln.strip() for ln in texto_numeros.splitlines()]
         for i, ln in enumerate(linhas_num):
-            if re.search(r"Nosso\s*n[u?]mero", ln, re.IGNORECASE):
+            if re.search(r"Nosso\s*n[uú]mero", ln, re.IGNORECASE):
                 janela = " ".join(linhas_num[i:i+8])
                 cands = re.findall(r"\b(\d{4,20}-\d{1,2}|\d{6,20})\b", janela)
-                nosso_numero = _escolher_melhor_nosso(cands)
+                nosso_numero = _escolher_melhor_nosso(cands, allow_leading_zeros=True)
                 if nosso_numero:
                     break
     if not nosso_numero:
@@ -740,7 +744,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
         beneficiario = re.sub(r"\s+R\$\s*$", "", beneficiario)
 
     m_benef_cnpj = re.search(
-        r"CPF/CNPJ Benefici[a?]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
+        r"CPF/CNPJ Benefici[aá]rio.*?\n.*?([0-9]{2}\.?[0-9]{3}\.?[0-9]{3}/?[0-9]{4}-?[0-9]{2})",
         texto,
         re.IGNORECASE | re.DOTALL,
     )
@@ -776,9 +780,43 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
                 base_final = base_digits[-4:] if len(base_digits) > 4 else base_digits
                 final_nosso = f"{base_final}-{digito_digits}"
         else:
-            final_nosso = final_nosso[-4:] if len(final_nosso) >= 4 else final_nosso
+            digitos_nosso = re.sub(r"\D", "", final_nosso)
+            digitos_significativos = digitos_nosso.lstrip("0") or digitos_nosso
+            m_sufixo_zeros = re.search(r"0{3,}(\d{5,6})$", digitos_nosso)
+            if m_sufixo_zeros:
+                final_nosso = m_sufixo_zeros.group(1).lstrip("0") or m_sufixo_zeros.group(1)
+            elif len(digitos_significativos) <= 5:
+                final_nosso = digitos_significativos
+            else:
+                final_nosso = digitos_significativos[-4:] if len(digitos_significativos) >= 4 else digitos_significativos
     sufixo = f" BLT {final_nosso}" if final_nosso else ""
     return f"BOLETO NF{nf} {pagador_curto}{sufixo}.pdf"
+
+
+def _nome_boleto_tem_numero(nome: str) -> bool:
+    nome_norm = _normalizar_nome_arquivo(nome).upper()
+    return bool(re.search(r"\bBLT\s+\d{3,}(?:-\d{1,2})?\b", nome_norm))
+
+
+def _nomear_boleto_pendente(info: dict[str, str | None], fallback_nome: str) -> str:
+    if _nome_boleto_tem_numero(fallback_nome):
+        return Path(fallback_nome).name
+    info_pendente = dict(info)
+    info_pendente["nosso_numero"] = None
+    return _nomear_boleto(info_pendente, fallback_nome)
+
+
+def _encaminhar_boleto_pendente(origem: Path, workspace_dir: Path, info: dict[str, str | None], log=print) -> Path | None:
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    novo_nome = _nomear_boleto_pendente(info, origem.name)
+    try:
+        if origem.parent.resolve() == workspace_dir.resolve() and origem.name == novo_nome:
+            log(f"Boleto pendente mantido no workspace para revisão manual: {origem.name}")
+            return origem
+    except Exception:
+        pass
+    log(f"Boleto pendente sem número identificado; enviando para o workspace: {origem.name} -> {novo_nome}")
+    return mover_pdf(origem, workspace_dir, log=log, novo_nome=novo_nome)
 
 
 def _extrair_nf_xml_texto(texto: str) -> str | None:
@@ -1349,6 +1387,7 @@ def processar_boletos(
     cnpj_mva: str,
     cnpj_horizonte: str,
     cache: dict,
+    workspace_dir: Path | None = None,
     log=print,
     debug_log=None,
 ) -> list[dict]:
@@ -1433,6 +1472,14 @@ def processar_boletos(
         elif texto_mva and texto_mva in benef:
             destino_dir = criar_pasta_data_boleto(destino_mva)
             empresa = "MVA"
+        if not (info_boleto.get("nosso_numero") or "").strip():
+            pendente_dir = workspace_dir or downloads_dir
+            movido = _encaminhar_boleto_pendente(caminho, pendente_dir, info_boleto, log=log)
+            if debug_log:
+                debug_log(f"[BOLETO] Pendente sem número: {caminho} -> {movido or caminho}")
+            cache[cache_key] = agora
+            continue
+
         novo_nome = _nomear_boleto(info_boleto, caminho.name)
         log(f"BOLETO movendo para: {destino_dir} ({empresa})")
         movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=novo_nome)
@@ -2853,7 +2900,7 @@ def _fluxo_primeira_execucao(base_dir: Path, log=print):
     r = QMessageBox.question(
         None,
         "Rascunho de e-mail",
-        "Deseja ativar a criacao de rascunhos de e-mail agora?",
+        "Deseja ativar a criação de rascunhos de e-mail agora?",
         QMessageBox.Yes | QMessageBox.No,
         QMessageBox.No,
     )
@@ -3037,6 +3084,7 @@ def _run_loop(stop_event: threading.Event, log):
                     cnpj_mva,
                     cnpj_horizonte,
                     cache,
+                    workspace_dir=base_dir,
                     log=log,
                     debug_log=debug_log,
                 )
@@ -3231,7 +3279,7 @@ def _abrir_review(base_dir: Path, log=print):
         from PySide6.QtCore import Qt, QThread, Signal
         from PySide6.QtGui import QTextCursor
     except Exception as e:
-        log(f"PySide6 n?o encontrado: {e}")
+        log(f"PySide6 não encontrado: {e}")
         return
 
     app = QApplication.instance()
@@ -3241,7 +3289,7 @@ def _abrir_review(base_dir: Path, log=print):
         created_app = True
 
     dialog = QDialog()
-    dialog.setWindowTitle("PdfWatcher - Revis?o Beatrice")
+    dialog.setWindowTitle("PdfWatcher - Revisão Beatrice")
     dialog.setMinimumSize(920, 620)
     dialog.setStyleSheet("""
         QDialog { background: #2a170f; color: #ffffff; }
@@ -3284,11 +3332,11 @@ def _abrir_review(base_dir: Path, log=print):
     layout.setContentsMargins(22, 20, 22, 20)
     layout.setSpacing(12)
 
-    title = QLabel("Revis?o Inteligente de Boletos (Beatrice)")
+    title = QLabel("Revisão Inteligente de Boletos (Beatrice)")
     title.setObjectName("title")
     subtitle = QLabel(
-        "Escolha uma pasta da estrutura m?s/ano para revisar. "
-        "A Beatrice n?o reprocessa mais tudo automaticamente."
+        "Escolha uma pasta da estrutura mês/ano para revisar. "
+        "A Beatrice não reprocessa mais tudo automaticamente."
     )
     subtitle.setObjectName("subtitle")
     layout.addWidget(title)
@@ -3339,7 +3387,7 @@ def _abrir_review(base_dir: Path, log=print):
         def run(self):
             target_folder = self.target_folder
             if not target_folder.exists():
-                self._log(f"ERRO: pasta n?o encontrada: {target_folder}")
+                self._log(f"ERRO: pasta não encontrada: {target_folder}")
                 self.finished_signal.emit()
                 return
 
@@ -3362,7 +3410,7 @@ def _abrir_review(base_dir: Path, log=print):
 
             for pdf_file in arquivos:
                 if not self._is_running:
-                    self._log("Interrup??o solicitada. Encerrando a revis?o atual...")
+                    self._log("Interrupção solicitada. Encerrando a revisão atual...")
                     break
 
                 texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
@@ -3371,14 +3419,19 @@ def _abrir_review(base_dir: Path, log=print):
 
                 if not info.get("nosso_numero"):
                     avisos += 1
-                    self._log(f"AVISO: n?mero do boleto n?o identificado em {pdf_file.name}")
+                    self._log(f"AVISO: número do boleto não identificado em {pdf_file.name}")
+                    novo_caminho = _encaminhar_boleto_pendente(pdf_file, self.base_dir, info, log=lambda msg: self._log(msg))
+                    if novo_caminho and novo_caminho != pdf_file:
+                        batch.append({"de": str(novo_caminho), "para": str(pdf_file)})
+                        corrigidos += 1
+                    continue
 
                 if novo_nome == pdf_file.name:
                     continue
 
                 novo_caminho = pdf_file.parent / novo_nome
                 if novo_caminho.exists():
-                    self._log(f"IGNORADO: destino j? existe para {pdf_file.name} -> {novo_nome}")
+                    self._log(f"IGNORADO: destino já existe para {pdf_file.name} -> {novo_nome}")
                     continue
 
                 try:
@@ -3387,7 +3440,7 @@ def _abrir_review(base_dir: Path, log=print):
                     corrigidos += 1
                     self._log(f"CORRIGIDO: {pdf_file.name} -> {novo_nome}")
                 except Exception as e:
-                    self._log(f"ERRO: n?o foi poss?vel mover {pdf_file.name}: {e}")
+                    self._log(f"ERRO: não foi possível mover {pdf_file.name}: {e}")
 
             if batch:
                 history.append({
@@ -3401,7 +3454,7 @@ def _abrir_review(base_dir: Path, log=print):
             else:
                 self._log("Finalizado. Nenhum boleto precisou ser corrigido.")
             if avisos:
-                self._log(f"Avisos: {avisos} arquivo(s) ficaram sem n?mero identificado automaticamente.")
+                self._log(f"Avisos: {avisos} arquivo(s) ficaram sem número identificado automaticamente.")
 
             self.finished_signal.emit()
 
@@ -3419,13 +3472,13 @@ def _abrir_review(base_dir: Path, log=print):
         def run(self):
             history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
             if not history:
-                self._log("Nenhum hist?rico para desfazer.")
+                self._log("Nenhum histórico para desfazer.")
                 self.finished_signal.emit()
                 return
 
             last_batch = history.pop()
             acoes = last_batch.get("acoes", [])
-            self._log(f"Desfazendo lote de {last_batch.get('data_execucao')} com {len(acoes)} a??o(?es)...")
+            self._log(f"Desfazendo lote de {last_batch.get('data_execucao')} com {len(acoes)} ação(ões)...")
 
             sucessos = 0
             for acao in acoes:
@@ -3439,10 +3492,10 @@ def _abrir_review(base_dir: Path, log=print):
                     except Exception as e:
                         self._log(f"ERRO: falha ao desfazer {de.name}: {e}")
                 else:
-                    self._log(f"IGNORADO: {de.name} n?o existe ou o destino j? est? ocupado.")
+                    self._log(f"IGNORADO: {de.name} não existe ou o destino já está ocupado.")
 
             _salvar_undo_history(self.base_dir, history, log=lambda *a: None)
-            self._log(f"Undo finalizado. {sucessos} a??o(?es) revertidas.")
+            self._log(f"Undo finalizado. {sucessos} ação(ões) revertidas.")
             self.finished_signal.emit()
 
     worker = None
@@ -3464,7 +3517,7 @@ def _abrir_review(base_dir: Path, log=print):
         btn_start.setEnabled(has_entry and (worker is None or not worker.isRunning()))
         if not has_entry:
             folder_path_label.setText("Nenhuma pasta de boletos encontrada na estrutura configurada.")
-            folder_info_label.setText("Revise a configura??o ou coloque os arquivos na pasta de destino correta.")
+            folder_info_label.setText("Revise a configuração ou coloque os arquivos na pasta de destino correta.")
             return
         folder_path_label.setText(f"Pasta: {entry['path']}")
         folder_info_label.setText(
@@ -3487,7 +3540,7 @@ def _abrir_review(base_dir: Path, log=print):
                         break
             folder_combo.setCurrentIndex(idx)
         else:
-            folder_combo.addItem("Nenhuma pasta dispon?vel")
+            folder_combo.addItem("Nenhuma pasta disponível")
         folder_combo.blockSignals(False)
         refresh_folder_details()
 
@@ -3501,7 +3554,7 @@ def _abrir_review(base_dir: Path, log=print):
         nonlocal worker
         entry = current_entry()
         if entry is None:
-            QMessageBox.warning(dialog, "Revis?o", "Selecione uma pasta v?lida para revisar.")
+            QMessageBox.warning(dialog, "Revisão", "Selecione uma pasta válida para revisar.")
             return
 
         text_log.clear()
@@ -3532,13 +3585,13 @@ def _abrir_review(base_dir: Path, log=print):
     def on_stop():
         if worker and isinstance(worker, ReviewWorker):
             worker.stop()
-            append_log("Interrompendo a revis?o atual, aguarde...")
+            append_log("Interrompendo a revisão atual, aguarde...")
 
     actions = QHBoxLayout()
-    btn_start = QPushButton("Iniciar revis?o")
+    btn_start = QPushButton("Iniciar revisão")
     btn_start.setProperty("class", "primary")
     btn_refresh = QPushButton("Atualizar lista")
-    btn_undo = QPushButton("Desfazer ?ltima revis?o")
+    btn_undo = QPushButton("Desfazer última revisão")
     btn_undo.setProperty("class", "warning")
     btn_stop = QPushButton("Parar")
     btn_stop.setProperty("class", "danger")
