@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.1.12"
+APP_VERSION = "1.1.13"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -1608,7 +1608,7 @@ _config_window_lock = threading.Lock()
 _config_process = None
 _logs_process = None
 _status_process = None
-_update_process = None
+_update_thread = None
 
 
 def _abrir_interface_config(base_dir: Path, log=print):
@@ -2747,21 +2747,34 @@ def _verificar_atualizacao_manual(base_dir: Path, log=print) -> None:
 
 
 def _verificar_atualizacao_em_thread(base_dir: Path, log=print):
-    global _update_process
+    global _update_thread
     with _config_window_lock:
-        if _update_process and _update_process.poll() is None:
+        if _update_thread and _update_thread.is_alive():
             return
-        try:
-            if getattr(sys, "frozen", False):
-                cmd = [sys.executable, "--check-update"]
-                cwd = str(Path(sys.executable).parent)
-            else:
-                cmd = [sys.executable, str(Path(__file__).resolve()), "--check-update"]
-                cwd = str(base_dir)
-            _update_process = subprocess.Popen(cmd, cwd=cwd)
-        except Exception as e:
-            log(f"Falha ao abrir verificador de atualização: {e}")
 
+        def _worker():
+            global _update_thread
+            try:
+                # Run the update flow inside the main app process so the restarted EXE
+                # does not collide with a still-running primary instance.
+                _verificar_atualizacao_github(
+                    base_dir,
+                    log=log,
+                    prompt=True,
+                    notify=True,
+                    exit_on_success=True,
+                    use_native_dialogs=True,
+                )
+            finally:
+                with _config_window_lock:
+                    _update_thread = None
+
+        _update_thread = threading.Thread(
+            target=_worker,
+            name="PdfWatcherUpdateCheck",
+            daemon=True,
+        )
+        _update_thread.start()
 
 def _fluxo_primeira_execucao(base_dir: Path, log=print):
     first_run = not _config_path(base_dir).exists()
