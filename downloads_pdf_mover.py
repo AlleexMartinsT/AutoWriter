@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -2775,7 +2775,6 @@ def _verificar_atualizacao_github(
 
         exe_atual = Path(sys.executable)
         pid = os.getpid()
-        bat = temp_dir / f"PdfWatcher_update_{pid}.bat"
         bat.write_text(
             "\n".join([
                 "@echo off",
@@ -2787,13 +2786,26 @@ def _verificar_atualizacao_github(
                 "tasklist /FI \"PID eq %PID%\" 2>nul | findstr /I \"%PID%\" >nul",
                 "if %errorlevel%==0 (timeout /t 1 >nul & goto wait)",
                 "move /Y \"%NEW_EXE%\" \"%OLD_EXE%\"",
+                "set PYINSTALLER_RESET_ENVIRONMENT=1",
+                "set _PYI_ARCHIVE_FILE=",
+                "set _PYI_APPLICATION_HOME_DIR=",
+                "set _PYI_PARENT_PROCESS_LEVEL=",
+                "set _MEIPASS2=",
                 "start \"\" \"%OLD_EXE%\"",
                 "del \"%~f0\"",
             ]),
             encoding="utf-8",
         )
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(["cmd", "/c", str(bat)], shell=False, creationflags=creationflags)
+        restart_env = os.environ.copy()
+        restart_env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        for env_name in ("_PYI_ARCHIVE_FILE", "_PYI_APPLICATION_HOME_DIR", "_PYI_PARENT_PROCESS_LEVEL", "_MEIPASS2"):
+            restart_env.pop(env_name, None)
+        try:
+            ctypes.windll.kernel32.SetDllDirectoryW(None)
+        except Exception:
+            pass
+        subprocess.Popen(["cmd", "/c", str(bat)], shell=False, creationflags=creationflags, env=restart_env)
         if exit_on_success:
             log("Atualização iniciada. Encerrando o aplicativo...")
             try:
