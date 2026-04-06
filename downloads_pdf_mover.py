@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.2.3"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -678,12 +678,29 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                     pagador = _normalizar_nome_arquivo(nome)
                     break
 
-    def _nosso_valido(valor: str | None, allow_leading_zeros: bool = False) -> bool:
+    def _parece_cep_truncado(valor: str | None, texto_ref: str) -> bool:
+        if not valor:
+            return False
+        valor = valor.strip()
+        if not re.fullmatch(r"\d{5}-\d{2}", valor):
+            return False
+        prefixo = re.sub(r"\D", "", valor)
+        for cep in re.findall(r"\d{5}-\d{3}", texto_ref):
+            if re.sub(r"\D", "", cep).startswith(prefixo):
+                return True
+        return False
+
+    def _linha_tem_nosso_numero(linha: str) -> bool:
+        return "NOSSO NUMERO" in _normalizar_nome_arquivo(linha).upper()
+
+    def _nosso_valido(valor: str | None, allow_leading_zeros: bool = False, texto_ref: str = "") -> bool:
         if not valor:
             return False
         valor = valor.strip()
         v = re.sub(r"\D", "", valor)
         if not v:
+            return False
+        if _parece_cep_truncado(valor, texto_ref):
             return False
         if v.startswith("0800") and len(v) <= 11:
             return False
@@ -693,13 +710,13 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             return False
         if "-" in valor:
             return len(v) >= 5
-        return len(v) >= 6
+        return len(v) >= 5
 
-    def _escolher_melhor_nosso(candidatos: list[str], allow_leading_zeros: bool = False) -> str | None:
+    def _escolher_melhor_nosso(candidatos: list[str], allow_leading_zeros: bool = False, texto_ref: str = "") -> str | None:
         validos = []
         for cand in candidatos:
             cand = cand.strip()
-            if not _nosso_valido(cand, allow_leading_zeros=allow_leading_zeros):
+            if not _nosso_valido(cand, allow_leading_zeros=allow_leading_zeros, texto_ref=texto_ref):
                 continue
             validos.append(cand)
         if not validos:
@@ -707,33 +724,47 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
         validos.sort(key=lambda c: (1 if "-" in c else 0, len(re.sub(r"\D", "", c))), reverse=True)
         return validos[0]
 
+    def _extrair_nosso_linha_documento(nf_ref: str | None, texto_ref: str) -> str | None:
+        if not nf_ref:
+            return None
+        linhas_ref = [ln.strip() for ln in texto_ref.splitlines()]
+        for ln in linhas_ref:
+            if not ln or nf_ref not in ln:
+                continue
+            ln_norm = f" {_normalizar_nome_arquivo(ln).upper()} "
+            if not any(marker in ln_norm for marker in (" DM ", " DS ", " NP ", " DMI ")):
+                continue
+            cands = re.findall(r"\d{4,20}(?:-\d{1,2})?", ln)
+            cands = [c for c in cands if c != nf_ref and not re.fullmatch(r"20\d{2}", c)]
+            nosso_doc = _escolher_melhor_nosso(cands, allow_leading_zeros=True, texto_ref=texto_ref)
+            if nosso_doc:
+                return nosso_doc
+        return None
+
     nosso_numero = None
-    m_cx = re.findall(r"\b(\d{11,20}-\d{1,2})\b", texto_numeros)
-    nosso_numero = _escolher_melhor_nosso(m_cx)
+    m_cx = re.findall(r"\d{11,20}-\d{1,2}", texto_numeros)
+    nosso_numero = _escolher_melhor_nosso(m_cx, texto_ref=texto_numeros)
     if not nosso_numero:
-        m_nosso = re.search(r"Nosso\s*n[uú]mero[\s\S]{0,180}?(\d{4,20}-\d{1,2}|\d{6,20})", texto_numeros, re.IGNORECASE)
-        if m_nosso and _nosso_valido(m_nosso.group(1), allow_leading_zeros=True):
+        nosso_numero = _extrair_nosso_linha_documento(nf, texto_numeros)
+    if not nosso_numero:
+        texto_nosso_norm = _normalizar_nome_arquivo(texto_numeros)
+        m_nosso = re.search(r"Nosso\s*numero.{0,180}?(\d{4,20}-\d{1,2}|\d{5,20})", texto_nosso_norm, re.IGNORECASE)
+        if m_nosso and _nosso_valido(m_nosso.group(1), allow_leading_zeros=True, texto_ref=texto_numeros):
             nosso_numero = m_nosso.group(1)
     if not nosso_numero:
         linhas_num = [ln.strip() for ln in texto_numeros.splitlines()]
         for i, ln in enumerate(linhas_num):
-            if re.search(r"Nosso\s*n[uú]mero", ln, re.IGNORECASE):
-                janela = " ".join(linhas_num[i:i+8])
-                cands = re.findall(r"\b(\d{4,20}-\d{1,2}|\d{6,20})\b", janela)
-                nosso_numero = _escolher_melhor_nosso(cands, allow_leading_zeros=True)
-                if nosso_numero:
-                    break
+            if not _linha_tem_nosso_numero(ln):
+                continue
+            janela = " ".join(linhas_num[i:i+8])
+            cands = re.findall(r"\d{4,20}-\d{1,2}|\d{5,20}", janela)
+            nosso_numero = _escolher_melhor_nosso(cands, allow_leading_zeros=True, texto_ref=texto_numeros)
+            if nosso_numero:
+                break
     if not nosso_numero:
-        linhas_num = [ln.strip() for ln in texto_numeros.splitlines()]
-        for ln in linhas_num:
-            if nf and nf in ln and re.search(r"\bDM\b|\bDS\b|\bN\b", ln):
-                cands = re.findall(r"\b(\d{4,20}-\d{1,2})\b", ln)
-                nosso_numero = _escolher_melhor_nosso(cands)
-                if nosso_numero:
-                    break
-    if not nosso_numero:
-        cands = re.findall(r"\b(\d{4,20}-\d{1,2})\b", texto_numeros)
-        nosso_numero = _escolher_melhor_nosso(cands)
+        cands = re.findall(r"\d{4,20}-\d{1,2}", texto_numeros)
+        nosso_numero = _escolher_melhor_nosso(cands, texto_ref=texto_numeros)
+
 
     beneficiario = _extrair_beneficiario(texto)
     if beneficiario:
