@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -816,7 +816,7 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
             m_sufixo_zeros = re.search(r"0{3,}(\d{5,6})$", digitos_nosso)
             if m_sufixo_zeros:
                 final_nosso = m_sufixo_zeros.group(1).lstrip("0") or m_sufixo_zeros.group(1)
-            elif len(digitos_significativos) <= 5:
+            elif len(digitos_significativos) <= 6:
                 final_nosso = digitos_significativos
             else:
                 final_nosso = digitos_significativos[-4:] if len(digitos_significativos) >= 4 else digitos_significativos
