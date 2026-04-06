@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -792,6 +792,30 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     }
 
 
+def _compactar_nosso_numero_para_nome(valor: str) -> str:
+    final_nosso = (valor or "").strip()
+    if not final_nosso:
+        return final_nosso
+    if "-" in final_nosso:
+        base, digito = final_nosso.rsplit("-", 1)
+        base_digits = re.sub(r"\D", "", base)
+        digito_digits = re.sub(r"\D", "", digito)
+        if base_digits and digito_digits:
+            if len(base_digits) <= 5:
+                return f"{base_digits}-{digito_digits}"
+            return f"{base_digits[-4:]}-{digito_digits}"
+        return final_nosso
+
+    digitos_nosso = re.sub(r"\D", "", final_nosso)
+    digitos_significativos = digitos_nosso.lstrip("0") or digitos_nosso
+    m_sufixo_zeros = re.search(r"0{3,}(\d{5,6})$", digitos_nosso)
+    if m_sufixo_zeros:
+        return m_sufixo_zeros.group(1).lstrip("0") or m_sufixo_zeros.group(1)
+    if len(digitos_significativos) <= 6:
+        return digitos_significativos
+    return digitos_significativos[-4:] if len(digitos_significativos) >= 4 else digitos_significativos
+
+
 def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
     nf = (info.get("nf") or "").strip()
     pagador = (info.get("pagador") or "").strip()
@@ -803,23 +827,7 @@ def _nomear_boleto(info: dict[str, str | None], fallback_nome: str) -> str:
     pagador_curto = " ".join(palavras[:2]).strip() if palavras else pagador_norm
     final_nosso = nosso_num
     if final_nosso:
-        if "-" in final_nosso:
-            base, digito = final_nosso.rsplit("-", 1)
-            base_digits = re.sub(r"\D", "", base)
-            digito_digits = re.sub(r"\D", "", digito)
-            if base_digits and digito_digits:
-                base_final = base_digits[-4:] if len(base_digits) > 4 else base_digits
-                final_nosso = f"{base_final}-{digito_digits}"
-        else:
-            digitos_nosso = re.sub(r"\D", "", final_nosso)
-            digitos_significativos = digitos_nosso.lstrip("0") or digitos_nosso
-            m_sufixo_zeros = re.search(r"0{3,}(\d{5,6})$", digitos_nosso)
-            if m_sufixo_zeros:
-                final_nosso = m_sufixo_zeros.group(1).lstrip("0") or m_sufixo_zeros.group(1)
-            elif len(digitos_significativos) <= 6:
-                final_nosso = digitos_significativos
-            else:
-                final_nosso = digitos_significativos[-4:] if len(digitos_significativos) >= 4 else digitos_significativos
+        final_nosso = _compactar_nosso_numero_para_nome(final_nosso)
     sufixo = f" BLT {final_nosso}" if final_nosso else ""
     return f"BOLETO NF{nf} {pagador_curto}{sufixo}.pdf"
 
@@ -3213,6 +3221,45 @@ def _salvar_undo_history(base_dir: Path, history: list, log=print):
     except Exception as e:
         log(f"Falha ao salvar histórico de undo: {e}")
 
+
+def _review_duplicates_dir(base_dir: Path) -> Path:
+    appdata = Path(os.getenv("APPDATA", str(base_dir)))
+    return Path(os.getenv("PDF_REVIEW_DUPLICATES_PATH", str(appdata / "PdfWatcher" / "review_duplicates")))
+
+
+def _listar_boletos_review(target_folder: Path) -> list[Path]:
+    return sorted(
+        p for p in target_folder.rglob("*.pdf")
+        if p.is_file() and p.name.upper().startswith("BOLETO NF")
+    )
+
+
+def _coletar_duplicatas_review(target_folder: Path) -> list[tuple[Path, Path]]:
+    duplicatas: list[tuple[Path, Path]] = []
+    for pdf_file in _listar_boletos_review(target_folder):
+        texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
+        info = _extrair_info_boleto_pdf(pdf_file, log=lambda *a: None, texto=texto)
+        if not info.get("nosso_numero"):
+            continue
+        novo_nome = _nomear_boleto(info, pdf_file.name)
+        if novo_nome == pdf_file.name:
+            continue
+        novo_caminho = pdf_file.parent / novo_nome
+        if novo_caminho.exists():
+            duplicatas.append((pdf_file, novo_caminho))
+    return duplicatas
+
+
+def _gerar_destino_duplicata_review(session_dir: Path, origem: Path) -> Path:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    destino = session_dir / origem.name
+    contador = 2
+    while destino.exists():
+        destino = session_dir / f"{origem.stem} ({contador}){origem.suffix}"
+        contador += 1
+    return destino
+
+
 _review_process = None
 _review_window_lock = threading.Lock()
 
@@ -3420,9 +3467,25 @@ def _abrir_review(base_dir: Path, log=print):
             self.base_dir = base_dir
             self.target_folder = target_folder
             self._is_running = True
+            self._pause_event = threading.Event()
+            self._pause_event.set()
 
         def stop(self):
             self._is_running = False
+            self._pause_event.set()
+
+        def pause(self):
+            if self._is_running and self._pause_event.is_set():
+                self._pause_event.clear()
+                self._log("Revisão pausada. Clique em Continuar para retomar.")
+
+        def resume(self):
+            if self._is_running and not self._pause_event.is_set():
+                self._pause_event.set()
+                self._log("Revisão retomada.")
+
+        def is_paused(self) -> bool:
+            return not self._pause_event.is_set()
 
         def _log(self, msg: str):
             self.log_signal.emit(msg)
@@ -3434,10 +3497,7 @@ def _abrir_review(base_dir: Path, log=print):
                 self.finished_signal.emit()
                 return
 
-            arquivos = sorted(
-                p for p in target_folder.rglob("*.pdf")
-                if p.is_file() and p.name.upper().startswith("BOLETO NF")
-            )
+            arquivos = _listar_boletos_review(target_folder)
             self._log(f"Pasta selecionada: {target_folder}")
             self._log(f"Boletos encontrados: {len(arquivos)}")
 
@@ -3450,10 +3510,16 @@ def _abrir_review(base_dir: Path, log=print):
             batch = []
             corrigidos = 0
             avisos = 0
+            duplicatas_ignoradas = 0
 
             for pdf_file in arquivos:
                 if not self._is_running:
-                    self._log("Interrupção solicitada. Encerrando a revisão atual...")
+                    self._log("Encerrando a revisão atual...")
+                    break
+                while self._is_running and self.is_paused():
+                    time.sleep(0.1)
+                if not self._is_running:
+                    self._log("Encerrando a revisão atual...")
                     break
 
                 texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
@@ -3474,6 +3540,7 @@ def _abrir_review(base_dir: Path, log=print):
 
                 novo_caminho = pdf_file.parent / novo_nome
                 if novo_caminho.exists():
+                    duplicatas_ignoradas += 1
                     self._log(f"IGNORADO: destino já existe para {pdf_file.name} -> {novo_nome}")
                     continue
 
@@ -3498,6 +3565,72 @@ def _abrir_review(base_dir: Path, log=print):
                 self._log("Finalizado. Nenhum boleto precisou ser corrigido.")
             if avisos:
                 self._log(f"Avisos: {avisos} arquivo(s) ficaram sem número identificado automaticamente.")
+            if duplicatas_ignoradas:
+                self._log(
+                    f"Duplicatas detectadas: {duplicatas_ignoradas} arquivo(s) ficaram na pasta porque o nome correto já existia. "
+                    f"Use 'Excluir duplicatas' para limpar esses casos."
+                )
+
+            self.finished_signal.emit()
+
+    class DuplicateCleanupWorker(QThread):
+        log_signal = Signal(str)
+        finished_signal = Signal()
+
+        def __init__(self, base_dir: Path, target_folder: Path):
+            super().__init__()
+            self.base_dir = base_dir
+            self.target_folder = target_folder
+
+        def _log(self, msg: str):
+            self.log_signal.emit(msg)
+
+        def run(self):
+            target_folder = self.target_folder
+            if not target_folder.exists():
+                self._log(f"ERRO: pasta não encontrada: {target_folder}")
+                self.finished_signal.emit()
+                return
+
+            duplicatas = _coletar_duplicatas_review(target_folder)
+            self._log(f"Pasta selecionada: {target_folder}")
+            self._log(f"Duplicatas encontradas: {len(duplicatas)}")
+
+            if not duplicatas:
+                self._log("Nenhuma duplicata elegível para exclusão foi encontrada nesta pasta.")
+                self.finished_signal.emit()
+                return
+
+            history = _carregar_undo_history(self.base_dir, log=lambda *a: None)
+            batch = []
+            session_dir = _review_duplicates_dir(self.base_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+            removidas = 0
+
+            for pdf_file, novo_caminho in duplicatas:
+                destino_lixeira = _gerar_destino_duplicata_review(session_dir, pdf_file)
+                try:
+                    shutil.move(str(pdf_file), str(destino_lixeira))
+                    batch.append({"de": str(destino_lixeira), "para": str(pdf_file)})
+                    removidas += 1
+                    self._log(
+                        f"EXCLUÍDA DUPLICATA: {pdf_file.name} | mantido: {novo_caminho.name}"
+                    )
+                except Exception as e:
+                    self._log(f"ERRO: não foi possível excluir a duplicata {pdf_file.name}: {e}")
+
+            if batch:
+                history.append({
+                    "data_execucao": datetime.now().isoformat(timespec="seconds"),
+                    "acoes": batch,
+                })
+                _salvar_undo_history(self.base_dir, history[-10:], log=lambda *a: None)
+
+            if removidas:
+                self._log(
+                    f"Limpeza concluída. {removidas} duplicata(s) foram removidas da pasta e podem ser restauradas em 'Desfazer última revisão'."
+                )
+            else:
+                self._log("Limpeza concluída. Nenhuma duplicata foi removida.")
 
             self.finished_signal.emit()
 
@@ -3557,15 +3690,16 @@ def _abrir_review(base_dir: Path, log=print):
     def refresh_folder_details():
         entry = current_entry()
         has_entry = entry is not None
-        btn_start.setEnabled(has_entry and (worker is None or not worker.isRunning()))
         if not has_entry:
             folder_path_label.setText("Nenhuma pasta de boletos encontrada na estrutura configurada.")
             folder_info_label.setText("Revise a configuração ou coloque os arquivos na pasta de destino correta.")
+            sync_controls()
             return
         folder_path_label.setText(f"Pasta: {entry['path']}")
         folder_info_label.setText(
             f"Origem: {entry['source']} | Boletos detectados: {entry['count']}"
         )
+        sync_controls()
 
     def reload_folders(preferred_path: str | None = None):
         nonlocal folder_entries
@@ -3587,11 +3721,19 @@ def _abrir_review(base_dir: Path, log=print):
         folder_combo.blockSignals(False)
         refresh_folder_details()
 
-    def set_running_state(running: bool):
-        folder_combo.setEnabled(not running and bool(folder_entries))
-        btn_refresh.setEnabled(not running)
-        btn_start.setEnabled((not running) and bool(folder_entries))
-        btn_undo.setEnabled(not running)
+    def sync_controls():
+        review_running = bool(worker and isinstance(worker, ReviewWorker) and worker.isRunning())
+        busy = bool(worker and worker.isRunning())
+        has_entry = current_entry() is not None
+
+        folder_combo.setEnabled((not busy) and bool(folder_entries))
+        btn_refresh.setEnabled(not busy)
+        btn_start.setEnabled((not busy) and has_entry)
+        btn_delete_duplicates.setEnabled((not busy) and has_entry)
+        btn_undo.setEnabled(not busy)
+        btn_pause.setEnabled(review_running)
+        btn_pause.setText("Continuar" if review_running and worker.is_paused() else "Pausar")
+        btn_close.setEnabled(not busy)
 
     def on_start():
         nonlocal worker
@@ -3601,56 +3743,101 @@ def _abrir_review(base_dir: Path, log=print):
             return
 
         text_log.clear()
-        set_running_state(True)
         worker = ReviewWorker(base_dir, Path(entry['path']))
         worker.log_signal.connect(append_log)
 
         def on_finished():
-            set_running_state(False)
+            nonlocal worker
+            worker = None
+            reload_folders(str(entry['path']))
 
         worker.finished_signal.connect(on_finished)
+        sync_controls()
         worker.start()
 
     def on_undo():
         nonlocal worker
         text_log.clear()
-        set_running_state(True)
         worker = UndoWorker(base_dir)
         worker.log_signal.connect(append_log)
 
         def on_finished():
-            set_running_state(False)
-            reload_folders(str(current_entry()['path']) if current_entry() else None)
+            nonlocal worker
+            preferred = str(current_entry()['path']) if current_entry() else None
+            worker = None
+            reload_folders(preferred)
 
         worker.finished_signal.connect(on_finished)
+        sync_controls()
         worker.start()
 
-    def on_stop():
-        if worker and isinstance(worker, ReviewWorker):
-            worker.stop()
-            append_log("Interrompendo a revisão atual, aguarde...")
+    def on_delete_duplicates():
+        nonlocal worker
+        entry = current_entry()
+        if entry is None:
+            QMessageBox.warning(dialog, "Duplicatas", "Selecione uma pasta válida para limpar.")
+            return
+
+        resposta = QMessageBox.question(
+            dialog,
+            "Excluir duplicatas",
+            (
+                "A Beatrice vai remover da pasta revisada os boletos cujo nome corrigido já existe.\n"
+                "Os arquivos removidos poderão ser restaurados em 'Desfazer última revisão'.\n\n"
+                "Deseja continuar?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if resposta != QMessageBox.Yes:
+            return
+
+        text_log.clear()
+        worker = DuplicateCleanupWorker(base_dir, Path(entry['path']))
+        worker.log_signal.connect(append_log)
+
+        def on_finished():
+            nonlocal worker
+            worker = None
+            reload_folders(str(entry['path']))
+
+        worker.finished_signal.connect(on_finished)
+        sync_controls()
+        worker.start()
+
+    def on_pause_toggle():
+        if worker and isinstance(worker, ReviewWorker) and worker.isRunning():
+            if worker.is_paused():
+                worker.resume()
+            else:
+                worker.pause()
+            sync_controls()
 
     actions = QHBoxLayout()
     btn_start = QPushButton("Iniciar revisão")
     btn_start.setProperty("class", "primary")
     btn_refresh = QPushButton("Atualizar lista")
+    btn_delete_duplicates = QPushButton("Excluir duplicatas")
+    btn_delete_duplicates.setProperty("class", "danger")
     btn_undo = QPushButton("Desfazer última revisão")
     btn_undo.setProperty("class", "warning")
-    btn_stop = QPushButton("Parar")
-    btn_stop.setProperty("class", "danger")
+    btn_pause = QPushButton("Pausar")
+    btn_pause.setProperty("class", "warning")
     btn_close = QPushButton("Fechar")
 
     btn_start.clicked.connect(on_start)
     btn_refresh.clicked.connect(lambda: reload_folders(str(current_entry()['path']) if current_entry() else None))
+    btn_delete_duplicates.clicked.connect(on_delete_duplicates)
     btn_undo.clicked.connect(on_undo)
-    btn_stop.clicked.connect(on_stop)
+    btn_pause.clicked.connect(on_pause_toggle)
     btn_close.clicked.connect(dialog.reject)
     folder_combo.currentIndexChanged.connect(refresh_folder_details)
 
     actions.addWidget(btn_start)
     actions.addWidget(btn_refresh)
+    actions.addWidget(btn_delete_duplicates)
     actions.addWidget(btn_undo)
-    actions.addWidget(btn_stop)
+    actions.addWidget(btn_pause)
     actions.addStretch(1)
     actions.addWidget(btn_close)
     layout.addLayout(actions)
@@ -3658,6 +3845,10 @@ def _abrir_review(base_dir: Path, log=print):
     reload_folders()
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     dialog.exec()
+
+    if worker and worker.isRunning() and isinstance(worker, ReviewWorker):
+        worker.stop()
+        worker.wait(3000)
 
     if created_app:
         app.quit()

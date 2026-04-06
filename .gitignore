@@ -8,6 +8,10 @@ __pycache__/
 # Build artifacts
 build/
 dist/
+build_test*/
+build_release*/
+dist_test*/
+dist_release*/
 *.spec.bak
 
 # IDE
