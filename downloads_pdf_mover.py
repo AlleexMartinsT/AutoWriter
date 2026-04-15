@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -446,10 +446,10 @@ def _ler_texto_bytes(data: bytes) -> str | None:
 
 def _extrair_nf_do_nome(nome: str) -> str | None:
     base = Path(nome).name
-    # Regra zweb: CNPJ-NF-ID.pdf
-    m_zweb = re.match(r"^\d{14}-(\d{4,9})-\d+\.pdf$", base, re.IGNORECASE)
+    # Zweb: CNPJ-NOSSO_NUMERO-BANCO.pdf (Não extrair NF daqui)
+    m_zweb = re.match(r"^\d{14}-\d+-\d+\.pdf$", base, re.IGNORECASE)
     if m_zweb:
-        return m_zweb.group(1).lstrip("0") or m_zweb.group(1)
+        return None
 
     m = re.search(r"\bNF[\s\-_]*0*([0-9]{1,9})\b", base, re.IGNORECASE)
     if m:
@@ -481,10 +481,37 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
 
     texto_numeros = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", texto)
 
-    m_nf = re.search(r"\bNF\s*0*([0-9]{1,12})\b", texto, re.IGNORECASE)
-    nf = m_nf.group(1).lstrip("0") if m_nf else None
+    nf = None
+    nosso_numero_sicoob = None
+
+    # I try to detect a Sicoob boleto by looking for an isolated "XXXX-D" line
+    # that immediately follows the beneficiary block — this is the "Nosso Número"
+    # In Sicoob boletos, the NF is derived from Nosso Número: strip the dash+check digit (7397-1 -> 73971)
+    linhas_texto = [ln.strip() for ln in texto.splitlines()]
+    for ln in linhas_texto:
+        # I match lines that are exclusively in the format DDDD-D or DDDDD-DD
+        m_nn_isolado = re.fullmatch(r"(\d{3,8})-(\d{1,2})", ln.strip())
+        if m_nn_isolado:
+            nosso_numero_sicoob = ln.strip()
+            nf = m_nn_isolado.group(1) + m_nn_isolado.group(2)
+            break
+
+    # I also check the summary line "NRDOC DM N DD/MM/YYYY NOSSO_NUMERO" as a fallback
+    if not nosso_numero_sicoob:
+        m_sicoob = re.search(
+            r"\b0*([1-9]\d{0,11})(?:-\d{1,2})?\s+(?:DM|DS|NP|DMI|OU)\s+(?:[SN]|[A-Z]{3}|SIM|NAO|N\xc3\x83O)?\s*\d{2}/\d{2}/\d{4}\s+(\d{3,8}-\d{1,2})\b",
+            texto_numeros, re.IGNORECASE
+        )
+        if m_sicoob:
+            nosso_numero_sicoob = m_sicoob.group(2)
+            partes = nosso_numero_sicoob.split("-")
+            nf = partes[0] + partes[1] if len(partes) == 2 else nosso_numero_sicoob
+
     if not nf:
-        m_nrdoc = re.search(r"Nr\.\s*do documento.*?\n\s*([0-9]{1,12})\b", texto, re.IGNORECASE | re.DOTALL)
+        m_nf = re.search(r"\bNF\s*0*([0-9]{1,12})\b", texto_numeros, re.IGNORECASE)
+        nf = m_nf.group(1).lstrip("0") if m_nf else None
+    if not nf:
+        m_nrdoc = re.search(r"Nr\.\s*do documento.*?\n\s*([0-9]{1,12})\b", texto_numeros, re.IGNORECASE | re.DOTALL)
         if m_nrdoc:
             nf = m_nrdoc.group(1).lstrip("0") or m_nrdoc.group(1)
     if not nf:
@@ -748,14 +775,15 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
                 return nosso_doc
         return None
 
-    nosso_numero = None
-    m_zweb_nome = re.match(r"^\d{14}-(\d+)-\d+\.pdf$", caminho.name, re.IGNORECASE)
-    if m_zweb_nome:
-        blt_digits = m_zweb_nome.group(1)
-        if len(blt_digits) >= 2:
-            nosso_numero = f"{blt_digits[:-1]}-{blt_digits[-1]}"
-        else:
-            nosso_numero = blt_digits
+    nosso_numero = nosso_numero_sicoob
+    if not nosso_numero:
+        m_zweb_nome = re.match(r"^\d{14}-(\d+)-\d+\.pdf$", caminho.name, re.IGNORECASE)
+        if m_zweb_nome:
+            blt_digits = m_zweb_nome.group(1)
+            if len(blt_digits) >= 2:
+                nosso_numero = f"{blt_digits[:-1]}-{blt_digits[-1]}"
+            else:
+                nosso_numero = blt_digits
 
     if not nosso_numero:
         m_cx = re.findall(r"\d{11,20}-\d{1,2}", texto_numeros)
