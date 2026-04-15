@@ -295,6 +295,8 @@ def _pdf_parece_boleto(nome: str, texto: str | None = None) -> bool:
     nome_norm = _normalizar_nome_arquivo(nome).upper()
     if "BOLETO" in nome_norm:
         return True
+    if re.match(r"^\d{14}-\d+-\d+\.pdf$", nome, re.IGNORECASE):
+        return True
     if texto:
         txt = texto.upper()
         if _linha_digitavel_boleto(txt):
@@ -2797,6 +2799,7 @@ def _verificar_atualizacao_github(
 
         exe_atual = Path(sys.executable)
         pid = os.getpid()
+        bat = temp_dir / "update.bat"
         bat.write_text(
             "\n".join([
                 "@echo off",
