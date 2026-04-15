@@ -15,6 +15,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 
 ## Melhorias recentes
 
+- Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.
 - O fluxo de `BOLETO` deixou de poluir o log com PDFs que não são boleto.
@@ -84,11 +85,26 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python downloads_pdf_mover.py --status
 ```
 
+- Apenas a tela de revisao Beatrice:
+
+```powershell
+.\.venv\Scripts\python downloads_pdf_mover.py --review
+```
+
+## Revisao Beatrice
+
+- Permite escolher uma pasta da estrutura mes/ano antes de revisar os boletos.
+- Pode corrigir nomes antigos com a mesma logica usada no fluxo normal do aplicativo.
+- Pode pausar e continuar a revisao sem encerrar o processo.
+- Pode excluir duplicatas quando o nome corrigido ja existe na mesma pasta.
+- A opcao `Desfazer ultima revisao` tambem restaura duplicatas removidas por essa limpeza.
+
 ## Menu da bandeja
 
 O ícone da bandeja oferece:
 
 - `Configurar pastas`
+- `Revisao de Boletos (Beatrice)`
 - `Status`
 - `Ver logs`
 - `Verificar atualização`

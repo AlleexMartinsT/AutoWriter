@@ -444,6 +444,11 @@ def _ler_texto_bytes(data: bytes) -> str | None:
 
 def _extrair_nf_do_nome(nome: str) -> str | None:
     base = Path(nome).name
+    # Regra zweb: CNPJ-NF-ID.pdf
+    m_zweb = re.match(r"^\d{14}-(\d{4,9})-\d+\.pdf$", base, re.IGNORECASE)
+    if m_zweb:
+        return m_zweb.group(1).lstrip("0") or m_zweb.group(1)
+
     m = re.search(r"\bNF[\s\-_]*0*([0-9]{1,9})\b", base, re.IGNORECASE)
     if m:
         return m.group(1).lstrip("0") or m.group(1)
@@ -742,8 +747,17 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
         return None
 
     nosso_numero = None
-    m_cx = re.findall(r"\d{11,20}-\d{1,2}", texto_numeros)
-    nosso_numero = _escolher_melhor_nosso(m_cx, texto_ref=texto_numeros)
+    m_zweb_nome = re.match(r"^\d{14}-(\d+)-\d+\.pdf$", caminho.name, re.IGNORECASE)
+    if m_zweb_nome:
+        blt_digits = m_zweb_nome.group(1)
+        if len(blt_digits) >= 2:
+            nosso_numero = f"{blt_digits[:-1]}-{blt_digits[-1]}"
+        else:
+            nosso_numero = blt_digits
+
+    if not nosso_numero:
+        m_cx = re.findall(r"\d{11,20}-\d{1,2}", texto_numeros)
+        nosso_numero = _escolher_melhor_nosso(m_cx, texto_ref=texto_numeros)
     if not nosso_numero:
         nosso_numero = _extrair_nosso_linha_documento(nf, texto_numeros)
     if not nosso_numero:

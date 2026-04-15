@@ -17,6 +17,7 @@ dist_release*/
 # IDE
 .vscode/
 .idea/
+AGENTS.md
 
 # Logs
 *.log
