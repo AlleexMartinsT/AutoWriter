@@ -484,28 +484,24 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     nf = None
     nosso_numero_sicoob = None
 
-    # I try to detect a Sicoob boleto by looking for an isolated "XXXX-D" line
-    # that immediately follows the beneficiary block — this is the "Nosso Número"
-    # In Sicoob boletos, the NF is derived from Nosso Número: strip the dash+check digit (7397-1 -> 73971)
-    linhas_texto = [ln.strip() for ln in texto.splitlines()]
-    for ln in linhas_texto:
-        # I match lines that are exclusively in the format DDDD-D or DDDDD-DD
-        m_nn_isolado = re.fullmatch(r"(\d{3,8})-(\d{1,2})", ln.strip())
-        if m_nn_isolado:
-            nosso_numero_sicoob = ln.strip()
-            nf = m_nn_isolado.group(1) + m_nn_isolado.group(2)
-            break
+    # I check the Sicoob summary line: "NRDOC DM N DD/MM/YYYY NOSSO_NUMERO"
+    # N. documento (e.g. 0020776-01) is the NF; the trailing XXXX-D is the Nosso Número
+    m_sicoob = re.search(
+        r"\b0*([1-9]\d{0,11})(?:-\d{1,2})?\s+(?:DM|DS|NP|DMI|OU)\s+(?:[SN]|[A-Z]{3}|SIM|NAO|N\xc3\x83O)?\s*\d{2}/\d{2}/\d{4}\s+(\d{3,8}-\d{1,2})\b",
+        texto_numeros, re.IGNORECASE
+    )
+    if m_sicoob:
+        nf = m_sicoob.group(1).lstrip("0") or m_sicoob.group(1)
+        nosso_numero_sicoob = m_sicoob.group(2)
 
-    # I also check the summary line "NRDOC DM N DD/MM/YYYY NOSSO_NUMERO" as a fallback
+    # I also look for an isolated "XXXX-D" line as Nosso Número fallback (when summary line absent)
     if not nosso_numero_sicoob:
-        m_sicoob = re.search(
-            r"\b0*([1-9]\d{0,11})(?:-\d{1,2})?\s+(?:DM|DS|NP|DMI|OU)\s+(?:[SN]|[A-Z]{3}|SIM|NAO|N\xc3\x83O)?\s*\d{2}/\d{2}/\d{4}\s+(\d{3,8}-\d{1,2})\b",
-            texto_numeros, re.IGNORECASE
-        )
-        if m_sicoob:
-            nosso_numero_sicoob = m_sicoob.group(2)
-            partes = nosso_numero_sicoob.split("-")
-            nf = partes[0] + partes[1] if len(partes) == 2 else nosso_numero_sicoob
+        linhas_texto = [ln.strip() for ln in texto.splitlines()]
+        for ln in linhas_texto:
+            m_nn_isolado = re.fullmatch(r"(\d{3,8})-(\d{1,2})", ln.strip())
+            if m_nn_isolado:
+                nosso_numero_sicoob = ln.strip()
+                break
 
     if not nf:
         m_nf = re.search(r"\bNF\s*0*([0-9]{1,12})\b", texto_numeros, re.IGNORECASE)
@@ -520,6 +516,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
             nf = m_ref.group(1).lstrip("0") or m_ref.group(1)
     if not nf:
         nf = _extrair_nf_do_nome(caminho.name)
+
 
     def _extrair_pagador(txt: str) -> str | None:
         linhas = [ln.strip() for ln in txt.splitlines()]
