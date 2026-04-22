@@ -906,6 +906,38 @@ def _extrair_nf_xml_texto(texto: str) -> str | None:
     return m.group(1).lstrip("0") or m.group(1)
 
 
+def _extrair_id_xml_texto(texto: str) -> str | None:
+    candidatos = []
+    m = re.search(r"<infNFe\b[^>]*\bId\s*=\s*['\"]([^'\"]+)['\"]", texto, re.IGNORECASE)
+    if m:
+        candidatos.append(m.group(1).strip())
+    candidatos.extend(
+        m.group(1).strip()
+        for m in re.finditer(r"\bId\s*=\s*['\"]([^'\"]*\d{44}[^'\"]*)['\"]", texto, re.IGNORECASE)
+    )
+
+    for valor in candidatos:
+        if valor.upper().startswith("NFE"):
+            valor = valor[3:]
+        digitos = re.sub(r"\D", "", valor)
+        if len(digitos) == 44:
+            return digitos
+        valor = _normalizar_nome_arquivo(valor)
+        if valor:
+            return valor
+    return None
+
+
+def _nome_xml_por_id(texto: str | None, fallback_nome: str) -> str:
+    xml_id = _extrair_id_xml_texto(texto or "")
+    if xml_id:
+        return f"{_normalizar_nome_arquivo(xml_id)}.xml"
+    base_nome = _normalizar_nome_arquivo(Path(fallback_nome).name) or "arquivo.xml"
+    if not base_nome.lower().endswith(".xml"):
+        base_nome += ".xml"
+    return base_nome
+
+
 def _extrair_dados_nf(texto: str) -> tuple[str | None, str | None]:
     nf_num = None
     m = re.search(r"N[ºo]\.?\s*([0-9\.\-]+)", texto, re.IGNORECASE)
@@ -966,10 +998,17 @@ def _destino_xml_por_cnpj(xml_texto: str, destinos_xml: dict[str, Path], cnpj_mv
     return None
 
 
-def _salvar_xml_bytes(destino_dir: Path, nome_arquivo: str, conteudo: bytes, log=print) -> Path | None:
-    base_nome = _normalizar_nome_arquivo(Path(nome_arquivo).name) or "arquivo.xml"
-    if not base_nome.lower().endswith(".xml"):
-        base_nome += ".xml"
+def _salvar_xml_bytes(
+    destino_dir: Path,
+    nome_arquivo: str,
+    conteudo: bytes,
+    log=print,
+    xml_texto: str | None = None,
+) -> Path | None:
+    base_nome = _nome_xml_por_id(
+        xml_texto if xml_texto is not None else _ler_texto_bytes(conteudo),
+        nome_arquivo,
+    )
     destino = destino_dir / base_nome
     if destino.exists():
         stem = destino.stem
@@ -1238,7 +1277,7 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
                     continue
                 nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome_interno)
                 destino_dir = criar_pasta_data(destino_base)
-                salvo = _salvar_xml_bytes(destino_dir, Path(nome_interno).name, raw, log=log)
+                salvo = _salvar_xml_bytes(destino_dir, Path(nome_interno).name, raw, log=log, xml_texto=texto)
                 if salvo:
                     movidos += 1
                     movidos_info.append({"tipo": "xml", "path": salvo, "nf": nf})
@@ -1285,7 +1324,7 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(xml_path.name)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
-        movido = mover_pdf(xml_path, destino_dir, log=log)
+        movido = mover_pdf(xml_path, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, xml_path.name))
         if movido:
             movidos += 1
             movidos_info.append({"tipo": "xml", "path": movido, "nf": nf})
@@ -1355,7 +1394,7 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
-        movido = mover_pdf(caminho, destino_dir, log=log)
+        movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, nome))
         if movido:
             movidos_info.append({"tipo": "xml", "path": movido, "nf": nf})
         cache[cache_key] = agora

@@ -6,6 +6,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 
 - Monitora pastas de origem separadas para `PDF`, `XML` e `BOLETO`.
 - Move arquivos para `MVA` ou `HORIZONTE`.
+- Renomeia XMLs pela chave/Id interno do próprio XML quando disponível.
 - Organiza os destinos por data:
   - `PDF/XML`: `ANO\MÊS`
   - `BOLETO`: `MM-AAAA`
