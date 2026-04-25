@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.11"
+APP_VERSION = "1.2.12"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -1143,7 +1143,19 @@ def _localizar_credentials(base_dir: Path) -> Path | None:
     return candidatos_bundle[0] if candidatos_bundle else None
 
 
-def _gmail_service(base_dir: Path, log=print):
+def _status_autenticacao_gmail(base_dir: Path) -> tuple[bool, str]:
+    creds_file = _localizar_credentials(base_dir)
+    if not creds_file:
+        return False, "Gmail: credentials.json não encontrado."
+
+    token_file = base_dir / "token.json"
+    if token_file.exists():
+        return True, f"Gmail: token encontrado em {token_file.name}."
+
+    return False, f"Gmail: pronto para autenticar com {creds_file.name}."
+
+
+def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -1164,13 +1176,19 @@ def _gmail_service(base_dir: Path, log=print):
     ]
 
     creds = None
-    if token_file.exists():
+    if force_reauth and token_file.exists():
+        try:
+            token_file.unlink()
+            log("Token Gmail anterior removido para reautenticação.")
+        except Exception as e:
+            log(f"Falha ao remover token Gmail anterior: {e}")
+    if not force_reauth and token_file.exists():
         try:
             creds = Credentials.from_authorized_user_file(str(token_file), scopes)
         except Exception:
             creds = None
     if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+        if not force_reauth and creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
             except Exception:
@@ -1184,6 +1202,19 @@ def _gmail_service(base_dir: Path, log=print):
     except Exception as e:
         log(f"Falha ao criar cliente Gmail: {e}")
         return None
+
+
+def _reautenticar_gmail(base_dir: Path, log=print) -> bool:
+    service = _gmail_service(base_dir, log=log, force_reauth=True)
+    if not service:
+        return False
+    try:
+        service.users().getProfile(userId="me").execute()
+        log("Reautenticação do Gmail concluída com sucesso.")
+        return True
+    except Exception as e:
+        log(f"Falha ao validar conta Gmail após reautenticação: {e}")
+        return False
 
 
 def _criar_rascunho_gmail(service, assunto: str, corpo: str, anexos: list[Path], log=print) -> str | None:
@@ -1915,6 +1946,17 @@ def _abrir_interface_config(base_dir: Path, log=print):
     chk_email.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
     main_layout.addWidget(chk_email)
 
+    gmail_row = QHBoxLayout()
+    gmail_row.setSpacing(10)
+    btn_gmail_auth = QPushButton("Reautenticar Gmail")
+    btn_gmail_auth.setProperty("class", "pick")
+    lbl_gmail_status = QLabel("")
+    lbl_gmail_status.setObjectName("subtitle")
+    lbl_gmail_status.setWordWrap(True)
+    gmail_row.addWidget(btn_gmail_auth)
+    gmail_row.addWidget(lbl_gmail_status, 1)
+    main_layout.addLayout(gmail_row)
+
     chk_debug = QCheckBox("Ativar debug detalhado (log técnico)")
     chk_debug.setChecked((cfg.get("debug_enabled", "0").strip() == "1"))
     chk_debug.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
@@ -1935,6 +1977,45 @@ def _abrir_interface_config(base_dir: Path, log=print):
     footer.addWidget(btn_salvar)
     main_layout.addLayout(footer)
 
+    def atualizar_status_gmail():
+        autenticado, status = _status_autenticacao_gmail(base_dir)
+        lbl_gmail_status.setText(status)
+        btn_gmail_auth.setEnabled(_localizar_credentials(base_dir) is not None)
+        btn_gmail_auth.setText("Reautenticar Gmail" if autenticado else "Autenticar Gmail")
+
+    def reautenticar_gmail():
+        if not _localizar_credentials(base_dir):
+            QMessageBox.warning(
+                dialog,
+                "Gmail",
+                "Arquivo de credenciais OAuth não encontrado.\nColoque o credentials.json ao lado do aplicativo.",
+            )
+            atualizar_status_gmail()
+            return
+
+        autenticado, _ = _status_autenticacao_gmail(base_dir)
+        pergunta = (
+            "Isso vai abrir o navegador para autenticar novamente a conta do Gmail.\nDeseja continuar?"
+            if autenticado
+            else "Isso vai abrir o navegador para autenticar a conta do Gmail.\nDeseja continuar?"
+        )
+        if QMessageBox.question(dialog, "Gmail", pergunta, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
+            return
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            ok = _reautenticar_gmail(base_dir, log=log)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        atualizar_status_gmail()
+        if ok:
+            QMessageBox.information(dialog, "Gmail", "Autenticação do Gmail concluída com sucesso.")
+        else:
+            QMessageBox.warning(dialog, "Gmail", "Não foi possível concluir a autenticação do Gmail.")
+
+    atualizar_status_gmail()
+
     def salvar():
         novo_cfg = {chave: edits[chave].text().strip() for _, chave in campos}
         novo_cfg["email_enabled"] = "1" if chk_email.isChecked() else "0"
@@ -1953,6 +2034,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
 
     btn_cancelar.clicked.connect(dialog.reject)
     btn_salvar.clicked.connect(salvar)
+    btn_gmail_auth.clicked.connect(reautenticar_gmail)
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
     dialog.exec()
 

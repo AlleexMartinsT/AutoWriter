@@ -13,9 +13,11 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - Mantém logs, relatório e estado persistidos em `%APPDATA%\PdfWatcher`.
 - Pode criar rascunhos de e-mail quando encontra `PDF + XML + BOLETO` da mesma NF.
 - Possui ícone na bandeja, janela de logs, janela de status e atualização automática/manual via GitHub Releases.
+- A autenticação do Gmail usa `credentials.json` externo ao lado do aplicativo, sem embutir esse arquivo no executável.
 
 ## Melhorias recentes
 
+- A tela de configuração agora possui botão para autenticar ou reautenticar o Gmail manualmente.
 - Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.
