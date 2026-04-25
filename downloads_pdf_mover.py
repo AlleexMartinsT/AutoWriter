@@ -28,7 +28,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.12"
+APP_VERSION = "1.2.13"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 
 
@@ -55,6 +55,13 @@ def _config_path(base_dir: Path) -> Path:
     config_dir = appdata / APP_NAME
     config_dir.mkdir(parents=True, exist_ok=True)
     return config_dir / CONFIG_FILE_NAME
+
+
+def _app_state_dir(base_dir: Path) -> Path:
+    appdata = Path(os.getenv("APPDATA", str(base_dir)))
+    state_dir = appdata / APP_NAME
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return state_dir
 
 
 def _log_path(base_dir: Path) -> Path:
@@ -1130,6 +1137,12 @@ def _montar_corpo_email(base_dir: Path, nf: str) -> str:
 
 
 def _localizar_credentials(base_dir: Path) -> Path | None:
+    p_state = _app_state_dir(base_dir) / "credentials.json"
+    if p_state.exists():
+        return p_state
+    candidatos_state = sorted(_app_state_dir(base_dir).glob("client_secret_*.json"))
+    if candidatos_state:
+        return candidatos_state[0]
     p = base_dir / "credentials.json"
     if p.exists():
         return p
@@ -1143,12 +1156,33 @@ def _localizar_credentials(base_dir: Path) -> Path | None:
     return candidatos_bundle[0] if candidatos_bundle else None
 
 
+def _token_gmail_path(base_dir: Path) -> Path:
+    p_state = _app_state_dir(base_dir) / "token.json"
+    if p_state.exists():
+        return p_state
+    p_legacy = base_dir / "token.json"
+    if p_legacy.exists():
+        return p_legacy
+    return p_state
+
+
+def _salvar_credentials_gmail(origem: Path, base_dir: Path, log=print) -> Path:
+    destino = _app_state_dir(base_dir) / "credentials.json"
+    try:
+        if origem.resolve() != destino.resolve():
+            shutil.copy2(origem, destino)
+        log(f"Credenciais Gmail salvas em: {destino}")
+        return destino
+    except Exception as e:
+        raise RuntimeError(f"Falha ao salvar credentials.json: {e}") from e
+
+
 def _status_autenticacao_gmail(base_dir: Path) -> tuple[bool, str]:
     creds_file = _localizar_credentials(base_dir)
     if not creds_file:
-        return False, "Gmail: credentials.json não encontrado."
+        return False, "Gmail: credentials.json não encontrado. Clique para selecionar o arquivo."
 
-    token_file = base_dir / "token.json"
+    token_file = _token_gmail_path(base_dir)
     if token_file.exists():
         return True, f"Gmail: token encontrado em {token_file.name}."
 
@@ -1169,19 +1203,23 @@ def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False):
     if not creds_file:
         log("Credenciais OAuth nao encontradas (credentials.json).")
         return None
-    token_file = base_dir / "token.json"
+    token_file = _token_gmail_path(base_dir)
     scopes = [
         "https://www.googleapis.com/auth/gmail.compose",
         "https://www.googleapis.com/auth/gmail.readonly",
     ]
 
     creds = None
-    if force_reauth and token_file.exists():
-        try:
-            token_file.unlink()
-            log("Token Gmail anterior removido para reautenticação.")
-        except Exception as e:
-            log(f"Falha ao remover token Gmail anterior: {e}")
+    if force_reauth:
+        for candidato in {_token_gmail_path(base_dir), base_dir / "token.json"}:
+            if not candidato.exists():
+                continue
+            try:
+                candidato.unlink()
+                log(f"Token Gmail anterior removido para reautenticação: {candidato.name}")
+            except Exception as e:
+                log(f"Falha ao remover token Gmail anterior: {e}")
+        token_file = _token_gmail_path(base_dir)
     if not force_reauth and token_file.exists():
         try:
             creds = Credentials.from_authorized_user_file(str(token_file), scopes)
@@ -1196,6 +1234,7 @@ def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False):
         if not creds:
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_file), scopes)
             creds = flow.run_local_server(port=0)
+        token_file.parent.mkdir(parents=True, exist_ok=True)
         token_file.write_text(creds.to_json(), encoding="utf-8")
     try:
         return build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -1980,18 +2019,35 @@ def _abrir_interface_config(base_dir: Path, log=print):
     def atualizar_status_gmail():
         autenticado, status = _status_autenticacao_gmail(base_dir)
         lbl_gmail_status.setText(status)
-        btn_gmail_auth.setEnabled(_localizar_credentials(base_dir) is not None)
-        btn_gmail_auth.setText("Reautenticar Gmail" if autenticado else "Autenticar Gmail")
+        creds_file = _localizar_credentials(base_dir)
+        btn_gmail_auth.setEnabled(True)
+        if not creds_file:
+            btn_gmail_auth.setText("Selecionar credentials.json")
+        else:
+            btn_gmail_auth.setText("Reautenticar Gmail" if autenticado else "Autenticar Gmail")
 
     def reautenticar_gmail():
-        if not _localizar_credentials(base_dir):
-            QMessageBox.warning(
+        creds_file = _localizar_credentials(base_dir)
+        if not creds_file:
+            selecionado, _ = QFileDialog.getOpenFileName(
                 dialog,
-                "Gmail",
-                "Arquivo de credenciais OAuth não encontrado.\nColoque o credentials.json ao lado do aplicativo.",
+                "Selecione o credentials.json do Gmail",
+                str(base_dir),
+                "Arquivos JSON (*.json)",
             )
-            atualizar_status_gmail()
-            return
+            if not selecionado:
+                atualizar_status_gmail()
+                return
+            try:
+                creds_file = _salvar_credentials_gmail(Path(selecionado), base_dir, log=log)
+            except Exception as e:
+                QMessageBox.warning(
+                    dialog,
+                    "Gmail",
+                    f"Não foi possível salvar o arquivo de credenciais.\n{e}",
+                )
+                atualizar_status_gmail()
+                return
 
         autenticado, _ = _status_autenticacao_gmail(base_dir)
         pergunta = (
