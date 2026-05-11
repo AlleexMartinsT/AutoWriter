@@ -29,7 +29,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 RECENT_NF_LIMIT_PER_GROUP = 50
@@ -454,6 +454,29 @@ def _report_status(valor: str | None) -> str:
 
 def _tem_pendencias_report_state(report_state: dict[str, str]) -> bool:
     return any(_report_status(valor) == "PENDENTE" for valor in report_state.values())
+
+
+def _assinatura_arquivo_existente(path: Path) -> str | None:
+    try:
+        st = path.stat()
+        return f"{st.st_size}|{int(st.st_mtime_ns)}"
+    except Exception:
+        return None
+
+
+def _filtrar_arquivos_existentes_relevantes(
+    arquivos: list[tuple[str, Path]],
+    seen_files: dict[str, str] | None = None,
+    only_new: bool = False,
+) -> list[tuple[str, Path, str, str | None]]:
+    relevantes = []
+    for grupo, path in arquivos:
+        key = str(path)
+        assinatura = _assinatura_arquivo_existente(path)
+        if only_new and seen_files is not None and assinatura and seen_files.get(key) == assinatura:
+            continue
+        relevantes.append((grupo, path, key, assinatura))
+    return relevantes
 
 
 def _atualizar_estado_nf_por_eventos(estado_nf: dict[str, dict[str, Path]], eventos: list[dict]) -> None:
@@ -1689,6 +1712,80 @@ def _excluir_rascunhos_gmail(service, nf: str, log=print) -> tuple[int, bool]:
     return removidos, ok
 
 
+def _conciliar_pendencias_com_enviados(
+    base_dir: Path,
+    service,
+    estado_nf: dict[str, dict[str, object]],
+    nfs_rascunho: set[str],
+    nfs_enviadas: set[str],
+    report_state: dict[str, str],
+    sent_cache: dict[str, tuple[float, bool | None]],
+    cache_ttl_seconds: int = 900,
+    log=print,
+    status_cb=None,
+) -> bool:
+    if not service:
+        return True
+
+    pendentes = []
+    for nf, bucket in list(estado_nf.items()):
+        tipos_presentes = {tipo for tipo, path in bucket.items() if isinstance(path, Path)}
+        if {"pdf", "xml", "boleto"}.issubset(tipos_presentes):
+            continue
+        if nf in nfs_enviadas:
+            continue
+        pendentes.append((nf, bucket))
+
+    if not pendentes:
+        return True
+
+    houve_envios = False
+    houve_rascunhos = False
+    gmail_ok = True
+    total = len(pendentes)
+    agora = time.time()
+
+    for idx_nf, (nf, _bucket) in enumerate(pendentes, start=1):
+        cache_entry = sent_cache.get(nf)
+        if cache_entry and (agora - cache_entry[0]) < cache_ttl_seconds:
+            enviada = cache_entry[1]
+        else:
+            if status_cb:
+                status_cb("Gmail", f"NF{nf}", idx_nf, total, "Conferindo enviados para pendência")
+            enviada = _nf_enviada_gmail(service, nf, log=log)
+            sent_cache[nf] = (time.time(), enviada)
+
+        if enviada is None:
+            gmail_ok = False
+            continue
+        if not enviada:
+            continue
+
+        removidos, limpeza_ok = _excluir_rascunhos_gmail(service, nf, log=log)
+        if not limpeza_ok:
+            gmail_ok = False
+        nfs_enviadas.add(nf)
+        estado_nf.pop(nf, None)
+        status = "JÁ ENVIADO"
+        motivo = "E-mail ja enviado"
+        if removidos:
+            motivo = f"{motivo}; {removidos} rascunho(s) removido(s)"
+            log(f"Rascunhos removidos para NF{nf}: {removidos}.")
+        if limpeza_ok and nf in nfs_rascunho:
+            nfs_rascunho.discard(nf)
+            houve_rascunhos = True
+        if report_state.get(nf) != f"{status}|{motivo}":
+            _registrar_relatorio(base_dir, nf, status, motivo, log=log)
+            report_state[nf] = f"{status}|{motivo}"
+        houve_envios = True
+
+    if houve_envios:
+        _salvar_nfs_enviadas(base_dir, nfs_enviadas, log=log)
+    if houve_rascunhos:
+        _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
+    return gmail_ok
+
+
 def _gmail_header(headers: list[dict] | None, name: str) -> str:
     for header in headers or []:
         if (header.get("name") or "").lower() == name.lower():
@@ -2308,8 +2405,11 @@ def _coletar_eventos_existentes_mes_atual(
     destinos_boleto: list[Path],
     log=print,
     status_cb=None,
+    seen_files: dict[str, str] | None = None,
+    only_new: bool = False,
 ) -> list[dict]:
     eventos = []
+    current_keys: set[str] = set()
 
     def pasta_ano_atual(base: Path) -> Path:
         hoje = datetime.now()
@@ -2323,12 +2423,16 @@ def _coletar_eventos_existentes_mes_atual(
             continue
         # PDFs ficam em subpastas de mês; varre o ano inteiro para compor trio entre meses.
         pdfs.extend([(grupo, p) for p in pasta.rglob("*.pdf") if p.is_file()])
-    for idx, (grupo, p) in enumerate(pdfs, start=1):
+    pdfs = _filtrar_arquivos_existentes_relevantes(pdfs, seen_files=seen_files, only_new=only_new)
+    current_keys.update(key for _, _, key, _ in pdfs)
+    for idx, (grupo, p, key, assinatura) in enumerate(pdfs, start=1):
         if status_cb:
             status_cb("PDF arquivado", p, idx, len(pdfs), "Lendo PDF arquivado")
         nf = _extrair_nf_do_nome(p.name)
         if nf:
             eventos.append({"tipo": "pdf", "path": p, "nf": nf, "grupo": grupo})
+        if seen_files is not None and assinatura:
+            seen_files[key] = assinatura
 
     boletos = []
     for idx_base, base in enumerate(destinos_boleto):
@@ -2337,7 +2441,9 @@ def _coletar_eventos_existentes_mes_atual(
             continue
         # Boletos podem estar em subpastas diferentes (ex.: "02-2026").
         boletos.extend([(grupo, p) for p in base.rglob("*.pdf") if p.is_file()])
-    for idx, (grupo, p) in enumerate(boletos, start=1):
+    boletos = _filtrar_arquivos_existentes_relevantes(boletos, seen_files=seen_files, only_new=only_new)
+    current_keys.update(key for _, _, key, _ in boletos)
+    for idx, (grupo, p, key, assinatura) in enumerate(boletos, start=1):
         if status_cb:
             status_cb("Boleto arquivado", p, idx, len(boletos), "Lendo boleto arquivado")
         nf = _extrair_nf_do_nome(p.name)
@@ -2346,6 +2452,8 @@ def _coletar_eventos_existentes_mes_atual(
             nf = (info.get("nf") or "").strip() or None
         if nf:
             eventos.append({"tipo": "boleto", "path": p, "nf": nf, "grupo": grupo})
+        if seen_files is not None and assinatura:
+            seen_files[key] = assinatura
 
     xmls = []
     for idx_base, base in enumerate(destinos_xml):
@@ -2355,7 +2463,9 @@ def _coletar_eventos_existentes_mes_atual(
             continue
         # XMLs também ficam em subpastas de mês.
         xmls.extend([(grupo, p) for p in pasta.rglob("*.xml") if p.is_file()])
-    for idx, (grupo, p) in enumerate(xmls, start=1):
+    xmls = _filtrar_arquivos_existentes_relevantes(xmls, seen_files=seen_files, only_new=only_new)
+    current_keys.update(key for _, _, key, _ in xmls)
+    for idx, (grupo, p, key, assinatura) in enumerate(xmls, start=1):
         if status_cb:
             status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
         nf = _extrair_nf_do_nome(p.name)
@@ -2364,6 +2474,12 @@ def _coletar_eventos_existentes_mes_atual(
             nf = _extrair_nf_xml_texto(txt)
         if nf:
             eventos.append({"tipo": "xml", "path": p, "nf": nf, "grupo": grupo})
+        if seen_files is not None and assinatura:
+            seen_files[key] = assinatura
+    if seen_files is not None and not only_new:
+        for key in list(seen_files):
+            if key not in current_keys:
+                seen_files.pop(key, None)
     return eventos
 
 
@@ -2486,6 +2602,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
     dialog.setStyleSheet("""
         QDialog { background: #2a170f; color: #ffffff; }
         QScrollArea { background: transparent; border: 0; }
+        QWidget#configScrollContent { background: #2a170f; }
         QScrollBar:vertical {
             background: #3a2418; width: 12px; margin: 2px 0 2px 0; border-radius: 6px;
         }
@@ -2552,6 +2669,9 @@ def _abrir_interface_config(base_dir: Path, log=print):
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     content = QWidget()
+    content.setObjectName("configScrollContent")
+    content.setAttribute(Qt.WA_StyledBackground, True)
+    scroll.viewport().setStyleSheet("background: #2a170f;")
     content_layout = QVBoxLayout(content)
     content_layout.setContentsMargins(0, 0, 4, 0)
     content_layout.setSpacing(12)
@@ -2775,6 +2895,10 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             QCheckBox,
             QMenu,
             QTextEdit,
+            QListWidget,
+            QListWidgetItem,
+            QWidgetAction,
+            QAbstractItemView,
         )
         from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher, QObject, QEvent
         from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
@@ -3191,17 +3315,41 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             title_action.setEnabled(False)
             menu.addAction(title_action)
             menu.addSeparator()
-            for item in pendencias[:40]:
+            lista = QListWidget(menu)
+            lista.setFocusPolicy(Qt.NoFocus)
+            lista.setSelectionMode(QAbstractItemView.NoSelection)
+            lista.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+            lista.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            lista.setWordWrap(True)
+            lista.setUniformItemSizes(False)
+            lista.setStyleSheet("""
+                QListWidget {
+                    background: #2f1d14; color: #ffffff; border: 1px solid #b86a27;
+                    border-radius: 8px; padding: 2px;
+                }
+                QListWidget::item {
+                    padding: 6px 8px; border-bottom: 1px solid #5a341d;
+                }
+                QListWidget::item:last {
+                    border-bottom: 0;
+                }
+            """)
+            for item in pendencias:
                 faltando = ", ".join(item["faltando"]) if item["faltando"] else "Nada identificado"
                 presentes = ", ".join(item["presentes"]) if item["presentes"] else "Nenhum item confirmado"
-                action = QAction(f"NF{item['nf']} | Falta: {faltando} | Já localizado: {presentes}", menu)
-                action.setEnabled(False)
-                menu.addAction(action)
-            if len(pendencias) > 40:
-                menu.addSeparator()
-                extra = QAction(f"+ {len(pendencias) - 40} NF(s) adicionais no relatório", menu)
-                extra.setEnabled(False)
-                menu.addAction(extra)
+                texto = f"NF{item['nf']} | Falta: {faltando}\nJá localizado: {presentes}"
+                row = QListWidgetItem(texto)
+                row.setFlags(Qt.ItemIsEnabled)
+                lista.addItem(row)
+            largura = 420
+            altura_linha = 46
+            altura = min(360, max(92, lista.sizeHintForRow(0) * min(len(pendencias), 7) + 12)) if pendencias else 92
+            if not lista.sizeHintForRow(0) or lista.sizeHintForRow(0) < 1:
+                altura = min(360, max(92, altura_linha * min(len(pendencias), 7) + 12))
+            lista.setFixedSize(largura, altura)
+            lista_action = QWidgetAction(menu)
+            lista_action.setDefaultWidget(lista)
+            menu.addAction(lista_action)
         menu.exec(alert_button.mapToGlobal(alert_button.rect().bottomRight()))
 
     def _atualizar_incremental(chave: str):
@@ -4169,6 +4317,7 @@ def _run_loop(stop_event: threading.Event, log):
     gmail_pending_retry_interval = max(10, int(os.getenv("GMAIL_PENDING_RETRY_INTERVAL", "60")))
     gmail_cleanup_interval = max(60, int(os.getenv("GMAIL_CLEANUP_INTERVAL", "3600")))
     gmail_draft_max_age_days = max(1, int(os.getenv("GMAIL_DRAFT_MAX_AGE_DAYS", "5")))
+    gmail_sent_reconcile_interval = max(60, int(os.getenv("GMAIL_SENT_RECONCILE_INTERVAL", "900")))
     existing_scan_interval = max(0, int(os.getenv("PDF_EXISTING_SCAN_INTERVAL", "300")))
     last_gmail_retry = 0.0
     last_gmail_pending_attempt = 0.0
@@ -4177,6 +4326,8 @@ def _run_loop(stop_event: threading.Event, log):
     last_existing_scan_at = 0.0
     last_existing_scan_seconds = 0.0
     cycle_started_iso = ""
+    existing_scan_seen: dict[str, str] = {}
+    sent_email_cache: dict[str, tuple[float, bool | None]] = {}
 
     def atualizar_status(
         phase: str,
@@ -4279,7 +4430,7 @@ def _run_loop(stop_event: threading.Event, log):
                 current_total=total_seguro,
             )
 
-        def coletar_eventos_existentes(detalhe: str) -> list[dict]:
+        def coletar_eventos_existentes(detalhe: str, only_new: bool = False) -> list[dict]:
             nonlocal last_existing_scan_at, last_existing_scan_seconds, historico_revisado_no_ciclo
             atualizar_status(
                 "Sincronizando histórico",
@@ -4298,6 +4449,8 @@ def _run_loop(stop_event: threading.Event, log):
                 status_cb=lambda kind, path, idx, total, action: status_item(
                     5, 15, kind, path, idx, total, action, "Sincronizando histórico"
                 ),
+                seen_files=existing_scan_seen,
+                only_new=only_new,
             )
             last_existing_scan_seconds = round(time.perf_counter() - existing_scan_started, 3)
             last_existing_scan_at = time.time()
@@ -4319,6 +4472,8 @@ def _run_loop(stop_event: threading.Event, log):
         )
         if nova_assinatura != assinatura_cfg:
             assinatura_cfg = nova_assinatura
+            existing_scan_seen.clear()
+            sent_email_cache.clear()
             log("Configuração carregada com sucesso.")
             log(f"Rascunho de e-mail: {'ATIVO' if email_ativo_novo else 'DESATIVADO'}")
             log(f"Debug detalhado: {'ATIVO' if debug_ativo_novo else 'DESATIVADO'}")
@@ -4346,7 +4501,7 @@ def _run_loop(stop_event: threading.Event, log):
             debug_ativo = debug_ativo_novo
             # Ao iniciar (ou ao trocar configuração), tenta compor trio PDF/XML/BOLETO
             # já existente nas pastas de destino do mês atual.
-            eventos.extend(coletar_eventos_existentes("Lendo arquivos já existentes nas pastas de destino..."))
+            eventos.extend(coletar_eventos_existentes("Lendo arquivos já existentes nas pastas de destino...", only_new=False))
 
         if debug_log:
             def _count_dir(path: Path) -> int:
@@ -4354,7 +4509,6 @@ def _run_loop(stop_event: threading.Event, log):
                     return len(os.listdir(path))
                 except Exception:
                     return -1
-            debug_log(f"[LOOP] tick {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             debug_log(f"[LOOP] origem PDF itens: {_count_dir(origem_pdf)}")
             debug_log(f"[LOOP] origem XML itens: {_count_dir(origem_xml)}")
             debug_log(f"[LOOP] origem BOLETO itens: {_count_dir(origem_boleto)}")
@@ -4469,7 +4623,7 @@ def _run_loop(stop_event: threading.Event, log):
             and existing_scan_interval > 0
             and time.time() - last_existing_scan_at >= existing_scan_interval
         ):
-            eventos.extend(coletar_eventos_existentes("Revisando NFs já arquivadas nas pastas de destino..."))
+            eventos.extend(coletar_eventos_existentes("Revisando NFs já arquivadas nas pastas de destino...", only_new=True))
 
         if time.time() - last_state_reload >= 300:
             atualizar_status(
@@ -4488,7 +4642,7 @@ def _run_loop(stop_event: threading.Event, log):
                 debug_log("[LOOP] Estado recarregado (rascunhos/enviados/relatorio).")
 
         if _tem_pendencias_report_state(report_state) and not historico_revisado_no_ciclo:
-            eventos.extend(coletar_eventos_existentes("Atualizando Pendências com arquivos já corrigidos..."))
+            eventos.extend(coletar_eventos_existentes("Atualizando Pendências com arquivos já corrigidos...", only_new=True))
 
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
@@ -4554,6 +4708,28 @@ def _run_loop(stop_event: threading.Event, log):
 
         _atualizar_estado_nf_por_eventos(estado_nf, eventos)
         if _sincronizar_pendencias_trio(base_dir, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log):
+            _salvar_report_state(base_dir, report_state, log=log)
+
+        if email_ativo_novo and gmail_service and _tem_pendencias_report_state(report_state):
+            gmail_ok = _conciliar_pendencias_com_enviados(
+                base_dir,
+                gmail_service,
+                estado_nf,
+                nfs_rascunho,
+                nfs_enviadas,
+                report_state,
+                sent_email_cache,
+                cache_ttl_seconds=gmail_sent_reconcile_interval,
+                log=log,
+                status_cb=lambda kind, item, idx, total, action: status_item(
+                    84, 85, kind, item, idx, total, action, "Conciliando pendências"
+                ),
+            )
+            if not gmail_ok:
+                gmail_service = None
+                last_gmail_retry = 0.0
+                last_gmail_pending_attempt = 0.0
+            _sincronizar_pendencias_trio(base_dir, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
             _salvar_report_state(base_dir, report_state, log=log)
 
         tem_gmail_pendente = _tem_nf_pronta_para_gmail(estado_nf, nfs_rascunho, nfs_enviadas)

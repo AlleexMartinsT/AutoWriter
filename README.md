@@ -36,6 +36,8 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque funcional e navegação por `Enter`, próximo e anterior.
 - A tela de `Configurar pastas` agora pode ser redimensionada e usa rolagem quando a altura da tela não comporta todos os campos.
 - Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
+- A varredura de arquivos já arquivados passou a reler apenas itens novos ou alterados após a carga inicial.
+- Pendências também são conciliadas com o Gmail enviado para evitar falso alerta em NF já enviada sem trio completo local.
 - A verificação de trio e de pendências agora considera apenas as 50 NFs numericamente mais altas de cada empresa, evitando alertas de semanas atrás.
 - Os logs principal e técnico são compactados automaticamente: linhas antigas são removidas e mensagens repetidas são filtradas.
 - Arquivos internos de estado agora são gravados com temporário único, retentativas e fallback para reduzir erro de `Acesso negado` no Windows quando há concorrência entre janelas/processos.
@@ -151,6 +153,7 @@ Por padrão:
 - `PDF_LOG_RETENTION_DAYS`
 - `GMAIL_RETRY_INTERVAL`
 - `GMAIL_PENDING_RETRY_INTERVAL`
+- `GMAIL_SENT_RECONCILE_INTERVAL`
 - `GMAIL_CLEANUP_INTERVAL`
 - `GMAIL_DRAFT_MAX_AGE_DAYS`
 - `PDF_LOG_PATH`
