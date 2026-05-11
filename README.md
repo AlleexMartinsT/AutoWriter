@@ -19,8 +19,10 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 
 - A tela de configuração agora possui botão para autenticar ou reautenticar o Gmail manualmente, sem seleção manual de `credentials.json`.
 - Antes de criar rascunho, o Gmail agora é consultado pelo número da NF nos e-mails enviados; se já houver envio, a NF é marcada como enviada e rascunhos correspondentes são removidos.
+- NFs marcadas no XML como `à vista` deixam de exigir boleto nas Pendências e passam a poder gerar rascunho só com `XML + PDF`.
 - Rascunhos do Gmail sem assunto ou com mais de 5 dias no rascunho também são removidos pela limpeza automática.
 - A integração Gmail passa a tentar reconectar e reprocessar pendências automaticamente, sem depender de desligar e ligar o aplicativo.
+- A autenticação Gmail agora tenta abrir o navegador com fallback explícito e, se a abertura automática falhar, exibe e copia o link de autorização.
 - Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.

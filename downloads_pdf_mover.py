@@ -19,6 +19,8 @@ import urllib.request
 import urllib.error
 import ssl
 import tempfile
+import webbrowser
+import wsgiref.simple_server
 from pathlib import Path
 
 MESES = [
@@ -29,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -498,16 +500,20 @@ def _pendencias_trio(base_dir: Path, log=print) -> list[dict[str, object]]:
         status, _, motivo = valor.partition("|")
         if status.strip().upper() != "PENDENTE":
             continue
+        motivo_upper = motivo.upper()
         faltando_raw = motivo
         if ":" in faltando_raw:
             faltando_raw = faltando_raw.split(":", 1)[1]
+        if "|" in faltando_raw:
+            faltando_raw = faltando_raw.split("|", 1)[0]
         faltando = []
         for item in re.split(r"[,;/]+", faltando_raw):
             tipo = item.strip().lower()
             if tipo in nomes:
                 faltando.append(tipo)
         faltando = sorted(set(faltando), key=lambda x: ordem.get(x, 99))
-        presentes = [tipo for tipo in ("pdf", "xml", "boleto") if tipo not in faltando]
+        tipos_relevantes = ("pdf", "xml") if "A VISTA" in motivo_upper else ("pdf", "xml", "boleto")
+        presentes = [tipo for tipo in tipos_relevantes if tipo not in faltando]
         pendencias.append({
             "nf": str(nf),
             "faltando": [nomes[tipo] for tipo in faltando],
@@ -560,6 +566,13 @@ def _atualizar_estado_nf_por_eventos(estado_nf: dict[str, dict[str, Path]], even
         grupo = str(ev.get("grupo") or "").strip().upper()
         if grupo:
             bucket["_grupo"] = grupo
+        if tipo == "xml":
+            boleto_required = ev.get("boleto_required")
+            if isinstance(boleto_required, bool):
+                bucket["_boleto_obrigatorio"] = boleto_required
+            pagamento_label = str(ev.get("payment_label") or "").strip()
+            if pagamento_label:
+                bucket["_payment_label"] = pagamento_label
     _limitar_estado_nf_recentes(estado_nf)
 
 
@@ -572,7 +585,6 @@ def _sincronizar_pendencias_trio(
     log=print,
 ) -> bool:
     mudou = False
-    tipos = {"pdf", "xml", "boleto"}
 
     for nf, bucket in list(estado_nf.items()):
         metadados = {
@@ -597,6 +609,7 @@ def _sincronizar_pendencias_trio(
             mudou = True
 
     for nf, bucket in list(estado_nf.items()):
+        tipos = _tipos_necessarios_bucket(bucket)
         tipos_presentes = {tipo for tipo, path in bucket.items() if isinstance(path, Path)}
         if nf in nfs_rascunho or nf in nfs_enviadas or tipos.issubset(tipos_presentes):
             if _report_status(report_state.get(nf)) == "PENDENTE":
@@ -606,6 +619,8 @@ def _sincronizar_pendencias_trio(
 
         faltando = tipos - tipos_presentes
         motivo = f"Faltando: {', '.join(sorted(faltando))}"
+        if not _bucket_exige_boleto(bucket):
+            motivo = f"{motivo} | NF a vista"
         valor = f"PENDENTE|{motivo}"
         if report_state.get(nf) != valor:
             _registrar_relatorio(base_dir, nf, "PENDENTE", motivo, log=log)
@@ -1371,6 +1386,57 @@ def _nome_xml_por_id(texto: str | None, fallback_nome: str) -> str:
     return base_nome
 
 
+_TPAG_A_VISTA_FALLBACK = {
+    "01", "02", "03", "04", "10", "11", "12", "13", "14", "16", "17", "18", "19",
+}
+
+
+def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
+    conteudo = texto or ""
+    ind_pags = [valor.strip() for valor in re.findall(r"<indPag>\s*([^<]+?)\s*</indPag>", conteudo, re.IGNORECASE)]
+    t_pags = [valor.strip() for valor in re.findall(r"<tPag>\s*([^<]+?)\s*</tPag>", conteudo, re.IGNORECASE)]
+    x_pags = [valor.strip() for valor in re.findall(r"<xPag>\s*([^<]+?)\s*</xPag>", conteudo, re.IGNORECASE)]
+    tem_cobr = bool(re.search(r"<cobr\b", conteudo, re.IGNORECASE))
+    tem_dup = bool(re.search(r"<dup\b", conteudo, re.IGNORECASE))
+
+    a_vista = any(valor == "0" for valor in ind_pags)
+    if not a_vista and not ind_pags:
+        x_pags_upper = [valor.upper() for valor in x_pags]
+        if any("A VISTA" in valor for valor in x_pags_upper):
+            a_vista = True
+        elif t_pags and set(t_pags).issubset(_TPAG_A_VISTA_FALLBACK) and not tem_cobr and not tem_dup:
+            a_vista = True
+
+    return {
+        "a_vista": a_vista,
+        "boleto_required": not a_vista,
+        "ind_pags": ind_pags,
+        "t_pags": t_pags,
+        "x_pags": x_pags,
+        "tem_cobr": tem_cobr,
+        "tem_dup": tem_dup,
+    }
+
+
+def _bucket_exige_boleto(bucket: dict[str, object]) -> bool:
+    valor = bucket.get("_boleto_obrigatorio")
+    if isinstance(valor, bool):
+        return valor
+
+    xml_path = bucket.get("xml")
+    if isinstance(xml_path, Path) and xml_path.exists():
+        resumo = _resumo_pagamento_xml(_ler_texto_arquivo(xml_path))
+        return bool(resumo.get("boleto_required", True))
+    return True
+
+
+def _tipos_necessarios_bucket(bucket: dict[str, object]) -> set[str]:
+    tipos = {"pdf", "xml"}
+    if _bucket_exige_boleto(bucket):
+        tipos.add("boleto")
+    return tipos
+
+
 def _extrair_dados_nf(texto: str) -> tuple[str | None, str | None]:
     nf_num = None
     m = re.search(r"N[ºo]\.?\s*([0-9\.\-]+)", texto, re.IGNORECASE)
@@ -1554,13 +1620,15 @@ def _template_path(base_dir: Path) -> Path:
 
 
 # Sessão Criador de Email
-def _montar_corpo_email(base_dir: Path, nf: str) -> str:
+def _montar_corpo_email(base_dir: Path, nf: str, incluir_boleto: bool = True) -> str:
     path = _template_path(base_dir)
     if path.exists():
         txt = path.read_text(encoding="utf-8", errors="ignore")
     else:
         txt = "Boa tarde!!!\n\nSegue em anexo XML PDF NF{NF} + BOLETO\n\n***Favor confirmar e-mail***\nAtt"
     txt = re.sub(r"\{NF\}", nf, txt, flags=re.IGNORECASE)
+    if not incluir_boleto:
+        txt = re.sub(r"\s*\+\s*BOLETO\b", "", txt, flags=re.IGNORECASE)
     if f"NF{nf}" not in txt:
         txt += f"\n\nNF{nf}"
     return txt
@@ -1619,7 +1687,56 @@ def _status_autenticacao_gmail(base_dir: Path) -> tuple[bool, str]:
     return False, "Gmail: pronto para autenticar."
 
 
-def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, interactive: bool = True):
+def _abrir_url_navegador(url: str, log=print) -> bool:
+    try:
+        if webbrowser.open(url, new=1, autoraise=True):
+            return True
+    except Exception as e:
+        log(f"Falha ao abrir navegador padrao para autenticacao Gmail: {e}")
+
+    try:
+        if hasattr(os, "startfile"):
+            os.startfile(url)
+            return True
+    except Exception as e:
+        log(f"Falha ao forcar abertura do navegador para autenticacao Gmail: {e}")
+    return False
+
+
+def _executar_fluxo_gmail_local(flow, log=print, auth_url_cb=None):
+    from google_auth_oauthlib.flow import _RedirectWSGIApp, _WSGIRequestHandler
+
+    success_message = "A autenticacao do Gmail foi concluida. Pode fechar esta janela."
+    wsgi_app = _RedirectWSGIApp(success_message)
+    wsgiref.simple_server.WSGIServer.allow_reuse_address = False
+    local_server = wsgiref.simple_server.make_server(
+        "localhost", 0, wsgi_app, handler_class=_WSGIRequestHandler
+    )
+
+    try:
+        flow.redirect_uri = f"http://localhost:{local_server.server_port}/"
+        auth_url, _ = flow.authorization_url()
+        abriu = _abrir_url_navegador(auth_url, log=log)
+        if callable(auth_url_cb):
+            try:
+                auth_url_cb(auth_url, abriu)
+            except Exception:
+                pass
+        if not abriu:
+            log(f"Abra manualmente este link para autenticar o Gmail: {auth_url}")
+        local_server.timeout = 300
+        local_server.handle_request()
+        if not wsgi_app.last_request_uri:
+            raise TimeoutError("A autenticacao do Gmail nao foi concluida a tempo.")
+        authorization_response = wsgi_app.last_request_uri.replace("http", "https")
+        flow.fetch_token(authorization_response=authorization_response)
+    finally:
+        local_server.server_close()
+
+    return flow.credentials
+
+
+def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, interactive: bool = True, auth_url_cb=None):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -1666,7 +1783,7 @@ def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, intera
                 log("Gmail requer autenticacao manual. Abra Configurar pastas e autentique a conta do Gmail.")
                 return None
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_file), scopes)
-            creds = flow.run_local_server(port=0)
+            creds = _executar_fluxo_gmail_local(flow, log=log, auth_url_cb=auth_url_cb)
         token_file.parent.mkdir(parents=True, exist_ok=True)
         token_file.write_text(creds.to_json(), encoding="utf-8")
     try:
@@ -1676,8 +1793,8 @@ def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, intera
         return None
 
 
-def _reautenticar_gmail(base_dir: Path, log=print) -> bool:
-    service = _gmail_service(base_dir, log=log, force_reauth=True)
+def _reautenticar_gmail(base_dir: Path, log=print, auth_url_cb=None) -> bool:
+    service = _gmail_service(base_dir, log=log, force_reauth=True, auth_url_cb=auth_url_cb)
     if not service:
         return False
     try:
@@ -1809,7 +1926,7 @@ def _conciliar_pendencias_com_enviados(
     pendentes = []
     for nf, bucket in list(estado_nf.items()):
         tipos_presentes = {tipo for tipo, path in bucket.items() if isinstance(path, Path)}
-        if {"pdf", "xml", "boleto"}.issubset(tipos_presentes):
+        if _tipos_necessarios_bucket(bucket).issubset(tipos_presentes):
             continue
         if nf in nfs_enviadas:
             continue
@@ -2018,12 +2135,20 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
                 if not destino_base:
                     continue
                 nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome_interno)
+                pagamento = _resumo_pagamento_xml(texto)
                 destino_dir = criar_pasta_data(destino_base)
                 salvo = _salvar_xml_bytes(destino_dir, Path(nome_interno).name, raw, log=log, xml_texto=texto)
                 if salvo:
                     movidos += 1
                     grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
-                    movidos_info.append({"tipo": "xml", "path": salvo, "nf": nf, "grupo": grupo})
+                    movidos_info.append({
+                        "tipo": "xml",
+                        "path": salvo,
+                        "nf": nf,
+                        "grupo": grupo,
+                        "boleto_required": bool(pagamento.get("boleto_required", True)),
+                        "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
+                    })
     except Exception as e:
         log(f"Erro processando ZIP de XML '{zip_path.name}': {e}")
         cache[zip_key] = time.time()
@@ -2067,13 +2192,21 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
             cache[xml_key] = time.time()
             continue
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(xml_path.name)
+        pagamento = _resumo_pagamento_xml(texto)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
         movido = mover_pdf(xml_path, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, xml_path.name))
         if movido:
             movidos += 1
             grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
-            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf, "grupo": grupo})
+            movidos_info.append({
+                "tipo": "xml",
+                "path": movido,
+                "nf": nf,
+                "grupo": grupo,
+                "boleto_required": bool(pagamento.get("boleto_required", True)),
+                "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
+            })
         cache[xml_key] = time.time()
     if movidos:
         log(f"Pasta de XML processada: {pasta.name} ({movidos} XML)")
@@ -2142,12 +2275,20 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
             cache[cache_key] = agora
             continue
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome)
+        pagamento = _resumo_pagamento_xml(texto)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
         movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, nome))
         if movido:
             grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
-            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf, "grupo": grupo})
+            movidos_info.append({
+                "tipo": "xml",
+                "path": movido,
+                "nf": nf,
+                "grupo": grupo,
+                "boleto_required": bool(pagamento.get("boleto_required", True)),
+                "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
+            })
         cache[cache_key] = agora
     return movidos_info
 
@@ -2382,7 +2523,7 @@ def _tentar_criar_rascunhos(
     for nf, bucket in list(estado_nf.items()):
         if nf in nfs_enviadas and nf not in nfs_rascunho:
             continue
-        if {"pdf", "xml", "boleto"}.issubset(bucket.keys()):
+        if _tipos_necessarios_bucket(bucket).issubset(set(bucket.keys())):
             prontas[nf] = bucket
 
     if not prontas or not service:
@@ -2455,9 +2596,12 @@ def _tentar_criar_rascunhos(
     for idx_nf, (nf, bucket) in enumerate(nao_enviadas, start=1):
         if status_cb:
             status_cb("Gmail", f"NF{nf}", idx_nf, len(nao_enviadas), "Criando rascunho")
-        assunto = f"XML PDF NF{nf} + BOLETO"
-        corpo = _montar_corpo_email(base_dir, nf)
-        anexos = [bucket["xml"], bucket["pdf"], bucket["boleto"]]
+        incluir_boleto = _bucket_exige_boleto(bucket)
+        assunto = f"XML PDF NF{nf}" + (" + BOLETO" if incluir_boleto else "")
+        corpo = _montar_corpo_email(base_dir, nf, incluir_boleto=incluir_boleto)
+        anexos = [bucket["xml"], bucket["pdf"]]
+        if incluir_boleto:
+            anexos.append(bucket["boleto"])
         draft_id = _criar_rascunho_gmail(service, assunto, corpo, anexos, log=log)
         if draft_id:
             nfs_rascunho.add(nf)
@@ -2544,12 +2688,20 @@ def _coletar_eventos_existentes_mes_atual(
     for idx, (grupo, p, key, assinatura) in enumerate(xmls, start=1):
         if status_cb:
             status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
+        txt = _ler_texto_arquivo(p) or ""
         nf = _extrair_nf_do_nome(p.name)
         if not nf:
-            txt = _ler_texto_arquivo(p) or ""
             nf = _extrair_nf_xml_texto(txt)
+        pagamento = _resumo_pagamento_xml(txt)
         if nf:
-            eventos.append({"tipo": "xml", "path": p, "nf": nf, "grupo": grupo})
+            eventos.append({
+                "tipo": "xml",
+                "path": p,
+                "nf": nf,
+                "grupo": grupo,
+                "boleto_required": bool(pagamento.get("boleto_required", True)),
+                "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
+            })
         if seen_files is not None and assinatura:
             seen_files[key] = assinatura
     if seen_files is not None and not only_new:
@@ -2886,9 +3038,25 @@ def _abrir_interface_config(base_dir: Path, log=print):
         if QMessageBox.question(dialog, "Gmail", pergunta, QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes) != QMessageBox.Yes:
             return
 
+        def informar_auth_url(url: str, abriu: bool):
+            lbl_gmail_status.setText("Gmail: aguardando conclusao da autenticacao no navegador...")
+            if abriu:
+                return
+            try:
+                QApplication.clipboard().setText(url)
+            except Exception:
+                pass
+            QMessageBox.information(
+                dialog,
+                "Gmail",
+                "O navegador nao abriu automaticamente.\n"
+                "O link de autenticacao foi copiado para a area de transferencia:\n\n"
+                f"{url}",
+            )
+
         try:
             QApplication.setOverrideCursor(Qt.WaitCursor)
-            ok = _reautenticar_gmail(base_dir, log=log)
+            ok = _reautenticar_gmail(base_dir, log=log, auth_url_cb=informar_auth_url)
         finally:
             QApplication.restoreOverrideCursor()
 
@@ -4560,7 +4728,7 @@ def _run_loop(stop_event: threading.Event, log):
                 last_gmail_retry = time.time()
                 gmail_service = _gmail_service(base_dir, log=log)
                 if gmail_service:
-                    log("Integração Gmail pronta. Rascunhos serão criados quando houver XML+PDF+BOLETO da mesma NF.")
+                    log("Integração Gmail pronta. Rascunhos serão criados quando houver XML+PDF+BOLETO, ou apenas XML+PDF para NF a vista.")
                 else:
                     log("Gmail indisponível no momento. O monitoramento de arquivos seguirá normalmente.")
             if not email_ativo_novo:
