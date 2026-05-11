@@ -29,10 +29,19 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
+_AUTO_CFG_FIX_LOGGED: set[str] = set()
 RECENT_NF_LIMIT_PER_GROUP = 50
+_LEGACY_DESTINATION_ALIASES: dict[str, dict[str, str]] = {
+    "pdf_destino_mva": {
+        r"Z:\CAIXA\PDF VENDAS 2026": r"Z:\CAIXA\PDF VENDAS\PDF VENDAS 2026",
+    },
+    "xml_destino_mva": {
+        r"Z:\CAIXA\XML VENDAS 2026": r"Z:\CAIXA\XML VENDAS\XML VENDAS 2026",
+    },
+}
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -41,9 +50,9 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "pdf_watch_dir": str(downloads),
         "xml_watch_dir": str(downloads),
         "boleto_watch_dir": str(downloads),
-        "pdf_destino_mva": r"Z:\CAIXA\PDF VENDAS 2026",
+        "pdf_destino_mva": r"Z:\CAIXA\PDF VENDAS\PDF VENDAS 2026",
         "pdf_destino_horizonte": r"\\192.168.1.240\eh\CAIXA PDF-XML-BOLETOS ELE. HORIZONTE\PDF VENDAS 2026",
-        "xml_destino_mva": r"Z:\CAIXA\XML VENDAS 2026",
+        "xml_destino_mva": r"Z:\CAIXA\XML VENDAS\XML VENDAS 2026",
         "xml_destino_horizonte": r"\\192.168.1.240\eh\CAIXA PDF-XML-BOLETOS ELE. HORIZONTE\XML VENDAS 2026",
         "boleto_destino_mva": r"Z:\CAIXA\BOLETOS\BOLETOS 2026",
         "boleto_destino_horizonte": r"\\192.168.1.240\eh\CAIXA PDF-XML-BOLETOS ELE. HORIZONTE\BOLETOS 2026",
@@ -53,6 +62,66 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "scan_interval_seconds": "2",
         "log_retention_days": "14",
     }
+
+
+def _path_norm_casefold(path_str: str) -> str:
+    return str(path_str or "").strip().replace("/", "\\").rstrip("\\").lower()
+
+
+def _resolver_destino_legado(key: str, path_str: str) -> Path | None:
+    bruto = str(path_str or "").strip()
+    if not bruto:
+        return None
+    path = Path(bruto)
+    try:
+        if path.exists():
+            return None
+    except Exception:
+        return None
+
+    aliases = _LEGACY_DESTINATION_ALIASES.get(key, {})
+    destino = None
+    bruto_norm = _path_norm_casefold(bruto)
+    for origem_alias, destino_alias in aliases.items():
+        if _path_norm_casefold(origem_alias) == bruto_norm:
+            destino = destino_alias
+            break
+    if not destino:
+        return None
+    candidato = Path(destino)
+    try:
+        if candidato.exists():
+            return candidato
+    except Exception:
+        return None
+    return None
+
+
+def _normalizar_caminhos_config(base_dir: Path, cfg: dict[str, str], log=print) -> dict[str, str]:
+    ajustes: list[tuple[str, str, str]] = []
+    for key in _LEGACY_DESTINATION_ALIASES:
+        original = str(cfg.get(key, "") or "").strip()
+        resolvido = _resolver_destino_legado(key, original)
+        if not original or resolvido is None:
+            continue
+        resolvido_str = str(resolvido)
+        if Path(original) == Path(resolvido_str):
+            continue
+        cfg[key] = resolvido_str
+        ajustes.append((key, original, resolvido_str))
+
+    if ajustes:
+        try:
+            _salvar_config(base_dir, cfg)
+        except Exception as e:
+            log(f"Falha ao persistir ajuste automatico de pastas: {e}")
+        for key, original, resolvido in ajustes:
+            chave_log = f"{key}|{original}|{resolvido}"
+            if chave_log in _AUTO_CFG_FIX_LOGGED:
+                continue
+            _AUTO_CFG_FIX_LOGGED.add(chave_log)
+            log(f"Caminho ajustado automaticamente ({key}): {original} -> {resolvido}")
+    return cfg
 
 
 def _config_path(base_dir: Path) -> Path:
@@ -290,7 +359,7 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
                 cfg["xml_watch_dir"] = str(dirs[0])
             if not os.getenv("BOLETO_WATCH_DIR", "").strip():
                 cfg["boleto_watch_dir"] = str(dirs[0])
-    return cfg
+    return _normalizar_caminhos_config(base_dir, cfg, log=log)
 
 
 def _salvar_config(base_dir: Path, cfg: dict[str, str]) -> None:
@@ -625,6 +694,16 @@ def criar_pasta_data_boleto(base_dir: Path) -> Path:
     destino = base_dir / hoje.strftime("%m-%Y")
     destino.mkdir(parents=True, exist_ok=True)
     return destino
+
+
+def _pasta_destino_mes_atual(base_dir: Path) -> Path:
+    hoje = datetime.now()
+    return base_dir / hoje.strftime("%Y") / MESES[hoje.month - 1]
+
+
+def _pasta_boleto_mes_atual(base_dir: Path) -> Path:
+    hoje = datetime.now()
+    return base_dir / hoje.strftime("%m-%Y")
 
 
 def _normalizar_nome_esperado(nome: str) -> str:
@@ -1531,13 +1610,13 @@ def _salvar_credentials_gmail(origem: Path, base_dir: Path, log=print) -> Path:
 def _status_autenticacao_gmail(base_dir: Path) -> tuple[bool, str]:
     creds_file = _localizar_credentials(base_dir)
     if not creds_file:
-        return False, "Gmail: credentials.json não encontrado. Clique para selecionar o arquivo."
+        return False, "Gmail: credenciais OAuth não encontradas nesta versão do aplicativo."
 
     token_file = _token_gmail_path(base_dir)
     if token_file.exists():
         return True, f"Gmail: token encontrado em {token_file.name}."
 
-    return False, f"Gmail: pronto para autenticar com {creds_file.name}."
+    return False, "Gmail: pronto para autenticar."
 
 
 def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, interactive: bool = True):
@@ -2411,17 +2490,13 @@ def _coletar_eventos_existentes_mes_atual(
     eventos = []
     current_keys: set[str] = set()
 
-    def pasta_ano_atual(base: Path) -> Path:
-        hoje = datetime.now()
-        return base / hoje.strftime("%Y")
-
     pdfs = []
     for idx_base, base in enumerate(destinos_pdf):
         grupo = "HORIZONTE" if idx_base == 1 else "MVA"
-        pasta = pasta_ano_atual(base)
+        pasta = _pasta_destino_mes_atual(base)
         if not pasta.exists():
             continue
-        # PDFs ficam em subpastas de mês; varre o ano inteiro para compor trio entre meses.
+        # PDFs arquivados so entram pelo mes atual para evitar releitura de meses antigos.
         pdfs.extend([(grupo, p) for p in pasta.rglob("*.pdf") if p.is_file()])
     pdfs = _filtrar_arquivos_existentes_relevantes(pdfs, seen_files=seen_files, only_new=only_new)
     current_keys.update(key for _, _, key, _ in pdfs)
@@ -2437,10 +2512,11 @@ def _coletar_eventos_existentes_mes_atual(
     boletos = []
     for idx_base, base in enumerate(destinos_boleto):
         grupo = "HORIZONTE" if idx_base == 1 else "MVA"
-        if not base.exists():
+        pasta = _pasta_boleto_mes_atual(base)
+        if not pasta.exists():
             continue
-        # Boletos podem estar em subpastas diferentes (ex.: "02-2026").
-        boletos.extend([(grupo, p) for p in base.rglob("*.pdf") if p.is_file()])
+        # Boletos arquivados tambem sao limitados ao mes atual.
+        boletos.extend([(grupo, p) for p in pasta.rglob("*.pdf") if p.is_file()])
     boletos = _filtrar_arquivos_existentes_relevantes(boletos, seen_files=seen_files, only_new=only_new)
     current_keys.update(key for _, _, key, _ in boletos)
     for idx, (grupo, p, key, assinatura) in enumerate(boletos, start=1):
@@ -2458,10 +2534,10 @@ def _coletar_eventos_existentes_mes_atual(
     xmls = []
     for idx_base, base in enumerate(destinos_xml):
         grupo = "HORIZONTE" if idx_base == 1 else "MVA"
-        pasta = pasta_ano_atual(base)
+        pasta = _pasta_destino_mes_atual(base)
         if not pasta.exists():
             continue
-        # XMLs também ficam em subpastas de mês.
+        # XMLs arquivados so entram pelo mes atual.
         xmls.extend([(grupo, p) for p in pasta.rglob("*.xml") if p.is_file()])
     xmls = _filtrar_arquivos_existentes_relevantes(xmls, seen_files=seen_files, only_new=only_new)
     current_keys.update(key for _, _, key, _ in xmls)
@@ -2782,34 +2858,24 @@ def _abrir_interface_config(base_dir: Path, log=print):
         autenticado, status = _status_autenticacao_gmail(base_dir)
         lbl_gmail_status.setText(status)
         creds_file = _localizar_credentials(base_dir)
-        btn_gmail_auth.setEnabled(True)
         if not creds_file:
-            btn_gmail_auth.setText("Selecionar credentials.json")
+            btn_gmail_auth.setText("Credenciais indisponíveis")
+            btn_gmail_auth.setEnabled(False)
         else:
+            btn_gmail_auth.setEnabled(True)
             btn_gmail_auth.setText("Reautenticar Gmail" if autenticado else "Autenticar Gmail")
 
     def reautenticar_gmail():
         creds_file = _localizar_credentials(base_dir)
         if not creds_file:
-            selecionado, _ = QFileDialog.getOpenFileName(
+            QMessageBox.warning(
                 dialog,
-                "Selecione o credentials.json do Gmail",
-                str(base_dir),
-                "Arquivos JSON (*.json)",
+                "Gmail",
+                "Esta versão do aplicativo não contém as credenciais OAuth do Gmail.\n"
+                "Reinstale ou atualize para uma versão com as credenciais embutidas.",
             )
-            if not selecionado:
-                atualizar_status_gmail()
-                return
-            try:
-                creds_file = _salvar_credentials_gmail(Path(selecionado), base_dir, log=log)
-            except Exception as e:
-                QMessageBox.warning(
-                    dialog,
-                    "Gmail",
-                    f"Não foi possível salvar o arquivo de credenciais.\n{e}",
-                )
-                atualizar_status_gmail()
-                return
+            atualizar_status_gmail()
+            return
 
         autenticado, _ = _status_autenticacao_gmail(base_dir)
         pergunta = (
@@ -4457,6 +4523,7 @@ def _run_loop(stop_event: threading.Event, log):
             historico_revisado_no_ciclo = True
             return coletados
 
+        mes_historico_atual = datetime.now().strftime("%Y-%m")
         nova_assinatura = (
             str(origem_pdf),
             str(origem_xml),
@@ -4469,9 +4536,11 @@ def _run_loop(stop_event: threading.Event, log):
             str(destino_boleto_horizonte),
             email_ativo_novo,
             debug_ativo_novo,
+            mes_historico_atual,
         )
         if nova_assinatura != assinatura_cfg:
             assinatura_cfg = nova_assinatura
+            estado_nf.clear()
             existing_scan_seen.clear()
             sent_email_cache.clear()
             log("Configuração carregada com sucesso.")
@@ -4501,7 +4570,7 @@ def _run_loop(stop_event: threading.Event, log):
             debug_ativo = debug_ativo_novo
             # Ao iniciar (ou ao trocar configuração), tenta compor trio PDF/XML/BOLETO
             # já existente nas pastas de destino do mês atual.
-            eventos.extend(coletar_eventos_existentes("Lendo arquivos já existentes nas pastas de destino...", only_new=False))
+            eventos.extend(coletar_eventos_existentes("Lendo arquivos já existentes nas pastas de destino do mês atual...", only_new=False))
 
         if debug_log:
             def _count_dir(path: Path) -> int:
@@ -4623,7 +4692,7 @@ def _run_loop(stop_event: threading.Event, log):
             and existing_scan_interval > 0
             and time.time() - last_existing_scan_at >= existing_scan_interval
         ):
-            eventos.extend(coletar_eventos_existentes("Revisando NFs já arquivadas nas pastas de destino...", only_new=True))
+            eventos.extend(coletar_eventos_existentes("Revisando NFs já arquivadas nas pastas do mês atual...", only_new=True))
 
         if time.time() - last_state_reload >= 300:
             atualizar_status(
@@ -4642,7 +4711,7 @@ def _run_loop(stop_event: threading.Event, log):
                 debug_log("[LOOP] Estado recarregado (rascunhos/enviados/relatorio).")
 
         if _tem_pendencias_report_state(report_state) and not historico_revisado_no_ciclo:
-            eventos.extend(coletar_eventos_existentes("Atualizando Pendências com arquivos já corrigidos...", only_new=True))
+            eventos.extend(coletar_eventos_existentes("Atualizando Pendências com arquivos já corrigidos no mês atual...", only_new=True))
 
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()

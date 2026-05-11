@@ -13,11 +13,11 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - Mantém logs, relatório e estado persistidos em `%APPDATA%\PdfWatcher`.
 - Pode criar rascunhos de e-mail quando encontra `PDF + XML + BOLETO` da mesma NF.
 - Possui ícone na bandeja, janela de logs, janela de status e atualização automática/manual via GitHub Releases.
-- A autenticação do Gmail usa `credentials.json` externo em `%APPDATA%\PdfWatcher`, sem embutir esse arquivo no executável.
+- A autenticação do Gmail usa `credentials.json` embutido no aplicativo; o usuário só precisa autenticar ou reautenticar a conta quando necessário.
 
 ## Melhorias recentes
 
-- A tela de configuração agora possui botão para selecionar, autenticar ou reautenticar o Gmail manualmente.
+- A tela de configuração agora possui botão para autenticar ou reautenticar o Gmail manualmente, sem seleção manual de `credentials.json`.
 - Antes de criar rascunho, o Gmail agora é consultado pelo número da NF nos e-mails enviados; se já houver envio, a NF é marcada como enviada e rascunhos correspondentes são removidos.
 - Rascunhos do Gmail sem assunto ou com mais de 5 dias no rascunho também são removidos pela limpeza automática.
 - A integração Gmail passa a tentar reconectar e reprocessar pendências automaticamente, sem depender de desligar e ligar o aplicativo.
@@ -35,8 +35,9 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
   - contagem de eventos `PDF/XML/BOLETO`
 - A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque funcional e navegação por `Enter`, próximo e anterior.
 - A tela de `Configurar pastas` agora pode ser redimensionada e usa rolagem quando a altura da tela não comporta todos os campos.
+- Apenas os dois caminhos legados exatos de MVA que saíram errados em versões anteriores, `Z:\CAIXA\PDF VENDAS 2026` e `Z:\CAIXA\XML VENDAS 2026`, são ajustados automaticamente para a estrutura real da rede quando necessário.
 - Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
-- A varredura de arquivos já arquivados passou a reler apenas itens novos ou alterados após a carga inicial.
+- A varredura de arquivos já arquivados passou a olhar somente as pastas do mês atual e, após a carga inicial, reler apenas itens novos ou alterados.
 - Pendências também são conciliadas com o Gmail enviado para evitar falso alerta em NF já enviada sem trio completo local.
 - A verificação de trio e de pendências agora considera apenas as 50 NFs numericamente mais altas de cada empresa, evitando alertas de semanas atrás.
 - Os logs principal e técnico são compactados automaticamente: linhas antigas são removidas e mensagens repetidas são filtradas.

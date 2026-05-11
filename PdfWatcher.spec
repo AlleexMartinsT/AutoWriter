@@ -6,6 +6,8 @@ project_dir = Path(SPECPATH).resolve()
 datas = [('favicon.ico', '.')]
 if (project_dir / 'message_template.txt').exists():
     datas.append(('message_template.txt', '.'))
+if (project_dir / 'credentials.json').exists():
+    datas.append(('credentials.json', '.'))
 
 a = Analysis(
     ['downloads_pdf_mover.py'],
