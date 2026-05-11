@@ -33,8 +33,10 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
   - duração do último ciclo
   - intervalo até a próxima varredura
   - contagem de eventos `PDF/XML/BOLETO`
-- A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque e navegação por resultado.
+- A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque funcional e navegação por `Enter`, próximo e anterior.
+- A tela de `Configurar pastas` agora pode ser redimensionada e usa rolagem quando a altura da tela não comporta todos os campos.
 - Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
+- A verificação de trio e de pendências agora considera apenas as 50 NFs numericamente mais altas de cada empresa, evitando alertas de semanas atrás.
 - Os logs principal e técnico são compactados automaticamente: linhas antigas são removidas e mensagens repetidas são filtradas.
 - Arquivos internos de estado agora são gravados com temporário único, retentativas e fallback para reduzir erro de `Acesso negado` no Windows quando há concorrência entre janelas/processos.
 - A verificação manual de atualização passou a abrir em subprocesso próprio, para evitar popup “travado”.

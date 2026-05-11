@@ -29,9 +29,10 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.19"
+APP_VERSION = "1.3.0"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
+RECENT_NF_LIMIT_PER_GROUP = 50
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -167,6 +168,52 @@ def _log_falha_gravacao_estado(contexto: str, path: Path, erro: str | None, log=
         return
     _STATE_WRITE_ERROR_LOG_AT[chave] = agora
     log(f"Falha ao salvar {contexto} '{path}' após retentativas: {erro}")
+
+
+def _nf_numero(nf: str | None) -> int | None:
+    valor = re.sub(r"\D", "", str(nf or ""))
+    if not valor:
+        return None
+    try:
+        return int(valor)
+    except Exception:
+        return None
+
+
+def _grupo_bucket(bucket: dict[str, object]) -> str:
+    grupo = str((bucket or {}).get("_grupo") or "").strip().upper()
+    return grupo or "GERAL"
+
+
+def _limitar_estado_nf_recentes(
+    estado_nf: dict[str, dict[str, object]],
+    limite_por_grupo: int = RECENT_NF_LIMIT_PER_GROUP,
+) -> bool:
+    if limite_por_grupo <= 0:
+        return False
+
+    numeros_por_grupo: dict[str, set[int]] = {}
+    for nf, bucket in estado_nf.items():
+        numero = _nf_numero(nf)
+        if numero is None:
+            continue
+        numeros_por_grupo.setdefault(_grupo_bucket(bucket), set()).add(numero)
+
+    permitidos_por_grupo = {
+        grupo: set(sorted(numeros, reverse=True)[:limite_por_grupo])
+        for grupo, numeros in numeros_por_grupo.items()
+    }
+
+    mudou = False
+    for nf, bucket in list(estado_nf.items()):
+        numero = _nf_numero(nf)
+        if numero is None:
+            continue
+        permitidos = permitidos_por_grupo.get(_grupo_bucket(bucket))
+        if permitidos is not None and numero not in permitidos:
+            estado_nf.pop(nf, None)
+            mudou = True
+    return mudou
 
 
 def _salvar_status(base_dir: Path, status: dict[str, object], log=print) -> None:
@@ -416,7 +463,12 @@ def _atualizar_estado_nf_por_eventos(estado_nf: dict[str, dict[str, Path]], even
         path = ev.get("path")
         if tipo not in {"pdf", "xml", "boleto"} or not nf or not path:
             continue
-        estado_nf.setdefault(nf, {})[tipo] = Path(path)
+        bucket = estado_nf.setdefault(nf, {})
+        bucket[tipo] = Path(path)
+        grupo = str(ev.get("grupo") or "").strip().upper()
+        if grupo:
+            bucket["_grupo"] = grupo
+    _limitar_estado_nf_recentes(estado_nf)
 
 
 def _sincronizar_pendencias_trio(
@@ -431,11 +483,17 @@ def _sincronizar_pendencias_trio(
     tipos = {"pdf", "xml", "boleto"}
 
     for nf, bucket in list(estado_nf.items()):
-        bucket_atual = {
+        metadados = {
+            chave: valor for chave, valor in bucket.items()
+            if str(chave).startswith("_")
+        }
+        bucket_paths = {
             tipo: path for tipo, path in bucket.items()
             if isinstance(path, Path) and path.exists()
         }
-        if bucket_atual:
+        if bucket_paths:
+            bucket_atual = dict(metadados)
+            bucket_atual.update(bucket_paths)
             if bucket_atual != bucket:
                 estado_nf[nf] = bucket_atual
         else:
@@ -447,13 +505,14 @@ def _sincronizar_pendencias_trio(
             mudou = True
 
     for nf, bucket in list(estado_nf.items()):
-        if nf in nfs_rascunho or nf in nfs_enviadas or tipos.issubset(bucket.keys()):
+        tipos_presentes = {tipo for tipo, path in bucket.items() if isinstance(path, Path)}
+        if nf in nfs_rascunho or nf in nfs_enviadas or tipos.issubset(tipos_presentes):
             if _report_status(report_state.get(nf)) == "PENDENTE":
                 report_state.pop(nf, None)
                 mudou = True
             continue
 
-        faltando = tipos - set(bucket.keys())
+        faltando = tipos - tipos_presentes
         motivo = f"Faltando: {', '.join(sorted(faltando))}"
         valor = f"PENDENTE|{motivo}"
         if report_state.get(nf) != valor:
@@ -1787,7 +1846,8 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
                 salvo = _salvar_xml_bytes(destino_dir, Path(nome_interno).name, raw, log=log, xml_texto=texto)
                 if salvo:
                     movidos += 1
-                    movidos_info.append({"tipo": "xml", "path": salvo, "nf": nf})
+                    grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+                    movidos_info.append({"tipo": "xml", "path": salvo, "nf": nf, "grupo": grupo})
     except Exception as e:
         log(f"Erro processando ZIP de XML '{zip_path.name}': {e}")
         cache[zip_key] = time.time()
@@ -1836,7 +1896,8 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
         movido = mover_pdf(xml_path, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, xml_path.name))
         if movido:
             movidos += 1
-            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf})
+            grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf, "grupo": grupo})
         cache[xml_key] = time.time()
     if movidos:
         log(f"Pasta de XML processada: {pasta.name} ({movidos} XML)")
@@ -1909,7 +1970,8 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
         log(f"XML movendo para: {destino_dir}")
         movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=_nome_xml_por_id(texto, nome))
         if movido:
-            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf})
+            grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+            movidos_info.append({"tipo": "xml", "path": movido, "nf": nf, "grupo": grupo})
         cache[cache_key] = agora
     return movidos_info
 
@@ -1982,7 +2044,7 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
             log(f"PDF movendo para: {destino_dir} ({novo_nome})")
             movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=novo_nome)
             if movido:
-                movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name)})
+                movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name), "grupo": "MVA"})
             cache[cache_key] = agora
             continue
         if texto_horizonte and texto and texto_horizonte.lower() in texto.lower():
@@ -1996,7 +2058,7 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
             log(f"PDF movendo para: {destino_dir} ({novo_nome})")
             movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=novo_nome)
             if movido:
-                movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name)})
+                movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name), "grupo": "HORIZONTE"})
             cache[cache_key] = agora
             continue
         cache[cache_key] = agora
@@ -2009,7 +2071,7 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
         log(f"PDF movendo para: {destino_dir}")
         movido = mover_pdf(caminho, destino_dir, log=log)
         if movido:
-            movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name)})
+            movidos_info.append({"tipo": "pdf", "path": movido, "nf": _extrair_nf_do_nome(movido.name), "grupo": "MVA"})
         cache[cache_key] = agora
     return movidos_info
 
@@ -2121,7 +2183,7 @@ def processar_boletos(
         log(f"BOLETO movendo para: {destino_dir} ({empresa})")
         movido = mover_pdf(caminho, destino_dir, log=log, novo_nome=novo_nome)
         if movido:
-            movidos_info.append({"tipo": "boleto", "path": movido, "nf": (info_boleto.get("nf") or _extrair_nf_do_nome(movido.name))})
+            movidos_info.append({"tipo": "boleto", "path": movido, "nf": (info_boleto.get("nf") or _extrair_nf_do_nome(movido.name)), "grupo": empresa})
         cache[cache_key] = agora
     return movidos_info
 
@@ -2254,26 +2316,28 @@ def _coletar_eventos_existentes_mes_atual(
         return base / hoje.strftime("%Y")
 
     pdfs = []
-    for base in destinos_pdf:
+    for idx_base, base in enumerate(destinos_pdf):
+        grupo = "HORIZONTE" if idx_base == 1 else "MVA"
         pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
         # PDFs ficam em subpastas de mês; varre o ano inteiro para compor trio entre meses.
-        pdfs.extend([p for p in pasta.rglob("*.pdf") if p.is_file()])
-    for idx, p in enumerate(pdfs, start=1):
+        pdfs.extend([(grupo, p) for p in pasta.rglob("*.pdf") if p.is_file()])
+    for idx, (grupo, p) in enumerate(pdfs, start=1):
         if status_cb:
             status_cb("PDF arquivado", p, idx, len(pdfs), "Lendo PDF arquivado")
         nf = _extrair_nf_do_nome(p.name)
         if nf:
-            eventos.append({"tipo": "pdf", "path": p, "nf": nf})
+            eventos.append({"tipo": "pdf", "path": p, "nf": nf, "grupo": grupo})
 
     boletos = []
-    for base in destinos_boleto:
+    for idx_base, base in enumerate(destinos_boleto):
+        grupo = "HORIZONTE" if idx_base == 1 else "MVA"
         if not base.exists():
             continue
         # Boletos podem estar em subpastas diferentes (ex.: "02-2026").
-        boletos.extend([p for p in base.rglob("*.pdf") if p.is_file()])
-    for idx, p in enumerate(boletos, start=1):
+        boletos.extend([(grupo, p) for p in base.rglob("*.pdf") if p.is_file()])
+    for idx, (grupo, p) in enumerate(boletos, start=1):
         if status_cb:
             status_cb("Boleto arquivado", p, idx, len(boletos), "Lendo boleto arquivado")
         nf = _extrair_nf_do_nome(p.name)
@@ -2281,16 +2345,17 @@ def _coletar_eventos_existentes_mes_atual(
             info = _extrair_info_boleto_pdf(p, log=log)
             nf = (info.get("nf") or "").strip() or None
         if nf:
-            eventos.append({"tipo": "boleto", "path": p, "nf": nf})
+            eventos.append({"tipo": "boleto", "path": p, "nf": nf, "grupo": grupo})
 
     xmls = []
-    for base in destinos_xml:
+    for idx_base, base in enumerate(destinos_xml):
+        grupo = "HORIZONTE" if idx_base == 1 else "MVA"
         pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
         # XMLs também ficam em subpastas de mês.
-        xmls.extend([p for p in pasta.rglob("*.xml") if p.is_file()])
-    for idx, p in enumerate(xmls, start=1):
+        xmls.extend([(grupo, p) for p in pasta.rglob("*.xml") if p.is_file()])
+    for idx, (grupo, p) in enumerate(xmls, start=1):
         if status_cb:
             status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
         nf = _extrair_nf_do_nome(p.name)
@@ -2298,7 +2363,7 @@ def _coletar_eventos_existentes_mes_atual(
             txt = _ler_texto_arquivo(p) or ""
             nf = _extrair_nf_xml_texto(txt)
         if nf:
-            eventos.append({"tipo": "xml", "path": p, "nf": nf})
+            eventos.append({"tipo": "xml", "path": p, "nf": nf, "grupo": grupo})
     return eventos
 
 
@@ -2385,6 +2450,8 @@ def _abrir_interface_config(base_dir: Path, log=print):
             QHBoxLayout,
             QCheckBox,
             QSpinBox,
+            QScrollArea,
+            QWidget,
         )
         from PySide6.QtCore import Qt
     except Exception as e:
@@ -2412,10 +2479,22 @@ def _abrir_interface_config(base_dir: Path, log=print):
 
     dialog = QDialog()
     dialog.setWindowTitle("PdfWatcher - Configuração de Pastas")
-    dialog.setMinimumWidth(920)
+    dialog.setMinimumSize(760, 520)
+    dialog.setSizeGripEnabled(True)
     dialog.setModal(True)
+    dialog.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
     dialog.setStyleSheet("""
         QDialog { background: #2a170f; color: #ffffff; }
+        QScrollArea { background: transparent; border: 0; }
+        QScrollBar:vertical {
+            background: #3a2418; width: 12px; margin: 2px 0 2px 0; border-radius: 6px;
+        }
+        QScrollBar::handle:vertical {
+            background: #b86a27; min-height: 28px; border-radius: 6px;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px; background: none; border: none;
+        }
         QLabel { color: #ffffff; }
         QLabel#title { font-size: 22px; font-weight: 700; color: #ff9f43; }
         QLabel#subtitle { color: #ffd7b0; }
@@ -2449,6 +2528,16 @@ def _abrir_interface_config(base_dir: Path, log=print):
         }
     """)
 
+    screen = dialog.screen() or app.primaryScreen()
+    if screen:
+        area = screen.availableGeometry()
+        dialog.resize(
+            min(980, max(760, area.width() - 80)),
+            min(760, max(520, area.height() - 80)),
+        )
+    else:
+        dialog.resize(980, 760)
+
     main_layout = QVBoxLayout(dialog)
     main_layout.setContentsMargins(22, 20, 22, 20)
     main_layout.setSpacing(12)
@@ -2459,6 +2548,14 @@ def _abrir_interface_config(base_dir: Path, log=print):
     subtitulo.setObjectName("subtitle")
     main_layout.addWidget(titulo)
     main_layout.addWidget(subtitulo)
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    content = QWidget()
+    content_layout = QVBoxLayout(content)
+    content_layout.setContentsMargins(0, 0, 4, 0)
+    content_layout.setSpacing(12)
+    main_layout.addWidget(scroll, 1)
 
     grid = QGridLayout()
     grid.setHorizontalSpacing(12)
@@ -2477,6 +2574,8 @@ def _abrir_interface_config(base_dir: Path, log=print):
         edit = QLineEdit(cfg.get(chave, ""))
         btn = QPushButton("Selecionar")
         btn.setProperty("class", "pick")
+        btn.setAutoDefault(False)
+        btn.setDefault(False)
         btn.clicked.connect(lambda _=False, c=chave: selecionar_pasta(c))
         edits[chave] = edit
         grid.addWidget(lbl, i, 0)
@@ -2484,7 +2583,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
         grid.addWidget(btn, i, 2)
 
     grid.setColumnStretch(1, 1)
-    main_layout.addLayout(grid)
+    content_layout.addLayout(grid)
 
     interval_row = QHBoxLayout()
     interval_row.setSpacing(10)
@@ -2500,7 +2599,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
     interval_row.addWidget(lbl_intervalo)
     interval_row.addWidget(spin_intervalo)
     interval_row.addWidget(lbl_intervalo_info, 1)
-    main_layout.addLayout(interval_row)
+    content_layout.addLayout(interval_row)
 
     retention_row = QHBoxLayout()
     retention_row.setSpacing(10)
@@ -2516,12 +2615,12 @@ def _abrir_interface_config(base_dir: Path, log=print):
     retention_row.addWidget(lbl_retention)
     retention_row.addWidget(spin_retention)
     retention_row.addWidget(lbl_retention_info, 1)
-    main_layout.addLayout(retention_row)
+    content_layout.addLayout(retention_row)
 
     chk_email = QCheckBox("Ativar criacao de rascunho de e-mail")
     chk_email.setChecked((cfg.get("email_enabled", "0").strip() == "1"))
     chk_email.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
-    main_layout.addWidget(chk_email)
+    content_layout.addWidget(chk_email)
 
     gmail_row = QHBoxLayout()
     gmail_row.setSpacing(10)
@@ -2532,17 +2631,19 @@ def _abrir_interface_config(base_dir: Path, log=print):
     lbl_gmail_status.setWordWrap(True)
     gmail_row.addWidget(btn_gmail_auth)
     gmail_row.addWidget(lbl_gmail_status, 1)
-    main_layout.addLayout(gmail_row)
+    content_layout.addLayout(gmail_row)
 
     chk_debug = QCheckBox("Ativar debug detalhado (log técnico)")
     chk_debug.setChecked((cfg.get("debug_enabled", "0").strip() == "1"))
     chk_debug.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
-    main_layout.addWidget(chk_debug)
+    content_layout.addWidget(chk_debug)
 
     chk_update = QCheckBox("Verificar atualização automaticamente")
     chk_update.setChecked((cfg.get("auto_update_enabled", "1").strip() == "1"))
     chk_update.setStyleSheet("QCheckBox { color: #ffffff; font-weight: 600; }")
-    main_layout.addWidget(chk_update)
+    content_layout.addWidget(chk_update)
+    content_layout.addStretch(1)
+    scroll.setWidget(content)
 
     footer = QHBoxLayout()
     footer.addStretch(1)
@@ -2550,6 +2651,9 @@ def _abrir_interface_config(base_dir: Path, log=print):
     btn_cancelar.setProperty("class", "cancel")
     btn_salvar = QPushButton("Salvar")
     btn_salvar.setProperty("class", "save")
+    for btn in (btn_cancelar, btn_salvar, btn_gmail_auth):
+        btn.setAutoDefault(False)
+        btn.setDefault(False)
     footer.addWidget(btn_cancelar)
     footer.addWidget(btn_salvar)
     main_layout.addLayout(footer)
@@ -2670,6 +2774,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             QWidget,
             QCheckBox,
             QMenu,
+            QTextEdit,
         )
         from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher, QObject, QEvent
         from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
@@ -2802,6 +2907,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             btn.setFixedWidth(30)
             btn.setToolTip(tip)
             btn.setFocusPolicy(Qt.NoFocus)
+            btn.setAutoDefault(False)
         lbl_search = QLabel("0/0", panel)
         lbl_search.setFixedWidth(42)
         lbl_search.setAlignment(Qt.AlignCenter)
@@ -2831,6 +2937,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     alert_button = QPushButton("!")
     alert_button.setObjectName("alert")
     alert_button.setToolTip("Clique para ver Pendências de PDF, XML ou BOLETO.")
+    alert_button.setFocusPolicy(Qt.NoFocus)
     alert_button.setVisible(False)
     tabs.setCornerWidget(alert_button, Qt.TopRightCorner)
 
@@ -2869,6 +2976,9 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     btn_open.setProperty("class", "secondary")
     btn_close = QPushButton("Fechar")
     btn_close.setProperty("class", "secondary")
+    for btn in (btn_refresh, btn_check_update, btn_open, btn_report, btn_close, btn_clear, alert_button):
+        btn.setAutoDefault(False)
+        btn.setDefault(False)
     actions.addWidget(btn_refresh)
     actions.addWidget(btn_check_update)
     actions.addWidget(btn_open)
@@ -2978,7 +3088,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             cursor = QTextCursor(widget.document())
             cursor.setPosition(start)
             cursor.setPosition(start + len(termo), QTextCursor.KeepAnchor)
-            sel = QPlainTextEdit.ExtraSelection()
+            sel = QTextEdit.ExtraSelection()
             sel.cursor = cursor
             sel.format = fmt_current if idx_match == current else fmt_match
             selections.append(sel)
@@ -3299,6 +3409,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         controle["next"].clicked.connect(lambda _checked=False, ch=chave: _navegar_busca(1, ch))
         controle["prev"].clicked.connect(lambda _checked=False, ch=chave: _navegar_busca(-1, ch))
         controle["input"].textChanged.connect(lambda *_args, ch=chave: _aplicar_busca(False, ch))
+        controle["input"].textEdited.connect(lambda *_args, ch=chave: _aplicar_busca(False, ch))
         controle["input"].returnPressed.connect(lambda ch=chave: _navegar_busca(1, ch))
     tabs.currentChanged.connect(lambda *_: _aplicar_busca(manter_indice=False))
     chk_show_dates.stateChanged.connect(lambda *_: (salvar_viewer(), _renderizar_chave("main"), _renderizar_chave("debug")))
