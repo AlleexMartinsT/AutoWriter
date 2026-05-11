@@ -12,7 +12,8 @@ import subprocess
 import mimetypes
 import base64
 from email.message import EmailMessage
-from datetime import datetime
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timedelta, timezone
 import ctypes
 import urllib.request
 import urllib.error
@@ -28,8 +29,9 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.2.13"
+APP_VERSION = "1.2.19"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
+_STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 
 
 def _default_paths(base_dir: Path) -> dict[str, str]:
@@ -47,6 +49,8 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "email_enabled": "0",
         "debug_enabled": "0",
         "auto_update_enabled": "1",
+        "scan_interval_seconds": "2",
+        "log_retention_days": "14",
     }
 
 
@@ -95,7 +99,16 @@ def _status_padrao() -> dict[str, object]:
         "busy": False,
         "phase": "Parado",
         "detail": "Aguardando inicialização.",
+        "progress_percent": 100,
+        "progress_label": "Em repouso",
+        "current_action": "",
+        "current_kind": "",
+        "current_file": "",
+        "current_dir": "",
+        "current_index": 0,
+        "current_total": 0,
         "scan_interval_seconds": 2,
+        "cycle_started_at": "",
         "last_cycle_seconds": 0.0,
         "last_cycle_finished_at": "",
         "last_existing_scan_seconds": 0.0,
@@ -107,16 +120,64 @@ def _status_padrao() -> dict[str, object]:
     }
 
 
+def _gravar_texto_resiliente(
+    path: Path,
+    conteudo: str,
+    encoding: str = "utf-8",
+    tentativas: int = 8,
+    espera_inicial: float = 0.04,
+) -> tuple[bool, str | None]:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ultimo_erro: Exception | None = None
+
+    for tentativa in range(max(1, tentativas)):
+        temp = path.with_name(
+            f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+        )
+        try:
+            temp.write_text(conteudo, encoding=encoding)
+            os.replace(temp, path)
+            return True, None
+        except Exception as e:
+            ultimo_erro = e
+            try:
+                if temp.exists():
+                    temp.unlink()
+            except Exception:
+                pass
+            if tentativa < tentativas - 1:
+                time.sleep(espera_inicial * (tentativa + 1))
+
+    try:
+        # Fallback não-atômico: melhor manter o app atualizado do que travar por
+        # um bloqueio temporário de rename no Windows.
+        path.write_text(conteudo, encoding=encoding)
+        return True, None
+    except Exception as e:
+        ultimo_erro = e
+
+    return False, str(ultimo_erro) if ultimo_erro else "erro desconhecido"
+
+
+def _log_falha_gravacao_estado(contexto: str, path: Path, erro: str | None, log=print) -> None:
+    chave = f"{contexto}|{path}"
+    agora = time.time()
+    if agora - _STATE_WRITE_ERROR_LOG_AT.get(chave, 0.0) < 60:
+        return
+    _STATE_WRITE_ERROR_LOG_AT[chave] = agora
+    log(f"Falha ao salvar {contexto} '{path}' após retentativas: {erro}")
+
+
 def _salvar_status(base_dir: Path, status: dict[str, object], log=print) -> None:
     path = _status_path(base_dir)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = dict(_status_padrao())
         payload.update(status or {})
         payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
-        temp = path.with_suffix(".tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(path)
+        ok, erro = _gravar_texto_resiliente(path, json.dumps(payload, ensure_ascii=False, indent=2))
+        if not ok:
+            _log_falha_gravacao_estado("status", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar status '{path}': {e}")
 
@@ -164,6 +225,8 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
         "email_enabled": "EMAIL_DRAFT_ENABLED",
         "debug_enabled": "DEBUG_LOG_ENABLED",
         "auto_update_enabled": "AUTO_UPDATE_ENABLED",
+        "scan_interval_seconds": "PDF_POLL_INTERVAL",
+        "log_retention_days": "PDF_LOG_RETENTION_DAYS",
     }
     for key, env_key in env_map.items():
         val = os.getenv(env_key, "").strip()
@@ -186,7 +249,93 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
 def _salvar_config(base_dir: Path, cfg: dict[str, str]) -> None:
     path = _config_path(base_dir)
     data = {k: (cfg.get(k, "") or "").strip() for k in _default_paths(base_dir)}
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    ok, erro = _gravar_texto_resiliente(path, json.dumps(data, indent=2, ensure_ascii=False))
+    if not ok:
+        raise OSError(f"Falha ao salvar configuração '{path}': {erro}")
+
+
+def _config_int(cfg: dict[str, str], key: str, default: int, minimo: int | None = None, maximo: int | None = None) -> int:
+    try:
+        valor = int(str(cfg.get(key, "")).strip())
+    except Exception:
+        valor = default
+    if minimo is not None:
+        valor = max(minimo, valor)
+    if maximo is not None:
+        valor = min(maximo, valor)
+    return valor
+
+
+def _corpo_linha_log(linha: str) -> str:
+    if linha.startswith("[") and "]" in linha:
+        return linha[linha.find("]") + 1 :].strip()
+    return linha.strip()
+
+
+def _parse_data_linha_log(linha: str) -> datetime | None:
+    if not linha.startswith("[") or "]" not in linha:
+        return None
+    prefixo = linha[1:linha.find("]")]
+    try:
+        return datetime.strptime(prefixo, "%d-%m-%Y %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _mensagem_repetida_no_log(log_path: Path, msg: str, tail_bytes: int = 120000) -> bool:
+    if not log_path.exists():
+        return False
+    alvo = msg.strip()
+    if not alvo:
+        return False
+    try:
+        size = log_path.stat().st_size
+        with log_path.open("rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+            raw = f.read().decode("utf-8", errors="ignore")
+        return any(_corpo_linha_log(linha) == alvo for linha in raw.splitlines())
+    except Exception:
+        return False
+
+
+def _compactar_arquivo_log(path: Path, retention_days: int = 14) -> dict[str, int]:
+    result = {"kept": 0, "removed_old": 0, "removed_duplicates": 0}
+    if not path.exists():
+        return result
+    retention_days = max(1, min(31, int(retention_days or 14)))
+    limite = datetime.now() - timedelta(days=retention_days)
+    try:
+        linhas = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return result
+
+    vistas: set[str] = set()
+    novas: list[str] = []
+    for linha in linhas:
+        data = _parse_data_linha_log(linha)
+        if data and data < limite:
+            result["removed_old"] += 1
+            continue
+        corpo = _corpo_linha_log(linha)
+        if corpo in vistas:
+            result["removed_duplicates"] += 1
+            continue
+        vistas.add(corpo)
+        novas.append(linha)
+
+    result["kept"] = len(novas)
+    if len(novas) != len(linhas):
+        _gravar_texto_resiliente(path, "\n".join(novas) + ("\n" if novas else ""))
+    return result
+
+
+def _compactar_logs(base_dir: Path, retention_days: int = 14) -> dict[str, dict[str, int]]:
+    return {
+        "main": _compactar_arquivo_log(_log_path(base_dir), retention_days),
+        "debug": _compactar_arquivo_log(_debug_log_path(base_dir), retention_days),
+    }
+
 
 def _log(msg: str, log_path: Path):
     ts = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
@@ -194,6 +343,8 @@ def _log(msg: str, log_path: Path):
     print(linha)
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        if _mensagem_repetida_no_log(log_path, msg):
+            return
         with log_path.open("a", encoding="utf-8") as f:
             f.write(linha + "\n")
     except Exception:
@@ -215,10 +366,123 @@ def _carregar_report_state(base_dir: Path, log=print) -> dict[str, str]:
 def _salvar_report_state(base_dir: Path, state: dict[str, str], log=print) -> None:
     path = _report_state_path(base_dir)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        ok, erro = _gravar_texto_resiliente(path, json.dumps(state, indent=2, ensure_ascii=False))
+        if not ok:
+            _log_falha_gravacao_estado("estado de relatório", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar estado de relatório '{path}': {e}")
+
+
+def _pendencias_trio(base_dir: Path, log=print) -> list[dict[str, object]]:
+    state = _carregar_report_state(base_dir, log=log)
+    pendencias = []
+    ordem = {"pdf": 0, "xml": 1, "boleto": 2}
+    nomes = {"pdf": "PDF", "xml": "XML", "boleto": "BOLETO"}
+    for nf, valor in state.items():
+        status, _, motivo = valor.partition("|")
+        if status.strip().upper() != "PENDENTE":
+            continue
+        faltando_raw = motivo
+        if ":" in faltando_raw:
+            faltando_raw = faltando_raw.split(":", 1)[1]
+        faltando = []
+        for item in re.split(r"[,;/]+", faltando_raw):
+            tipo = item.strip().lower()
+            if tipo in nomes:
+                faltando.append(tipo)
+        faltando = sorted(set(faltando), key=lambda x: ordem.get(x, 99))
+        presentes = [tipo for tipo in ("pdf", "xml", "boleto") if tipo not in faltando]
+        pendencias.append({
+            "nf": str(nf),
+            "faltando": [nomes[tipo] for tipo in faltando],
+            "presentes": [nomes[tipo] for tipo in presentes],
+            "motivo": motivo.strip(),
+        })
+    return sorted(pendencias, key=lambda item: int(item["nf"]) if str(item["nf"]).isdigit() else str(item["nf"]))
+
+
+def _report_status(valor: str | None) -> str:
+    return (valor or "").partition("|")[0].strip().upper()
+
+
+def _tem_pendencias_report_state(report_state: dict[str, str]) -> bool:
+    return any(_report_status(valor) == "PENDENTE" for valor in report_state.values())
+
+
+def _atualizar_estado_nf_por_eventos(estado_nf: dict[str, dict[str, Path]], eventos: list[dict]) -> None:
+    for ev in eventos:
+        tipo = ev.get("tipo")
+        nf = (ev.get("nf") or "").strip()
+        path = ev.get("path")
+        if tipo not in {"pdf", "xml", "boleto"} or not nf or not path:
+            continue
+        estado_nf.setdefault(nf, {})[tipo] = Path(path)
+
+
+def _sincronizar_pendencias_trio(
+    base_dir: Path,
+    estado_nf: dict[str, dict[str, Path]],
+    nfs_rascunho: set[str],
+    nfs_enviadas: set[str],
+    report_state: dict[str, str],
+    log=print,
+) -> bool:
+    mudou = False
+    tipos = {"pdf", "xml", "boleto"}
+
+    for nf, bucket in list(estado_nf.items()):
+        bucket_atual = {
+            tipo: path for tipo, path in bucket.items()
+            if isinstance(path, Path) and path.exists()
+        }
+        if bucket_atual:
+            if bucket_atual != bucket:
+                estado_nf[nf] = bucket_atual
+        else:
+            estado_nf.pop(nf, None)
+
+    for nf in list(report_state):
+        if _report_status(report_state.get(nf)) == "PENDENTE" and nf not in estado_nf:
+            report_state.pop(nf, None)
+            mudou = True
+
+    for nf, bucket in list(estado_nf.items()):
+        if nf in nfs_rascunho or nf in nfs_enviadas or tipos.issubset(bucket.keys()):
+            if _report_status(report_state.get(nf)) == "PENDENTE":
+                report_state.pop(nf, None)
+                mudou = True
+            continue
+
+        faltando = tipos - set(bucket.keys())
+        motivo = f"Faltando: {', '.join(sorted(faltando))}"
+        valor = f"PENDENTE|{motivo}"
+        if report_state.get(nf) != valor:
+            _registrar_relatorio(base_dir, nf, "PENDENTE", motivo, log=log)
+            report_state[nf] = valor
+            mudou = True
+    return mudou
+
+
+def _formatar_pendencias_trio(base_dir: Path, log=print) -> str:
+    pendencias = _pendencias_trio(base_dir, log=log)
+    if not pendencias:
+        return "Nenhuma NF pendente no momento."
+    linhas = [
+        "PENDÊNCIAS",
+        "",
+        f"Total pendente: {len(pendencias)} NF(s)",
+        "",
+    ]
+    for item in pendencias:
+        faltando = ", ".join(item["faltando"]) if item["faltando"] else "Nada identificado"
+        presentes = ", ".join(item["presentes"]) if item["presentes"] else "Nenhum item confirmado"
+        linhas.extend([
+            f"NF{item['nf']}",
+            f"  FALTANDO: {faltando}",
+            f"  Já localizado: {presentes}",
+            "",
+        ])
+    return "\n".join(linhas).rstrip()
 
 
 def _carregar_viewer_settings(base_dir: Path, log=print) -> dict[str, bool]:
@@ -246,8 +510,9 @@ def _carregar_viewer_settings(base_dir: Path, log=print) -> dict[str, bool]:
 def _salvar_viewer_settings(base_dir: Path, settings: dict[str, bool], log=print) -> None:
     path = _viewer_settings_path(base_dir)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+        ok, erro = _gravar_texto_resiliente(path, json.dumps(settings, indent=2, ensure_ascii=False))
+        if not ok:
+            _log_falha_gravacao_estado("configurações do visualizador", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar configuracoes do visualizador '{path}': {e}")
 
@@ -1081,7 +1346,9 @@ def _salvar_nfs_rascunho(base_dir: Path, nfs: set[str], log=print) -> None:
         conteudo = "\n".join(sorted(nfs))
         if conteudo:
             conteudo += "\n"
-        path.write_text(conteudo, encoding="utf-8")
+        ok, erro = _gravar_texto_resiliente(path, conteudo)
+        if not ok:
+            _log_falha_gravacao_estado("estado de rascunhos", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar estado de rascunhos '{path}': {e}")
 
@@ -1110,7 +1377,9 @@ def _salvar_nfs_enviadas(base_dir: Path, nfs: set[str], log=print) -> None:
         conteudo = "\n".join(sorted(nfs))
         if conteudo:
             conteudo += "\n"
-        path.write_text(conteudo, encoding="utf-8")
+        ok, erro = _gravar_texto_resiliente(path, conteudo)
+        if not ok:
+            _log_falha_gravacao_estado("estado de enviados", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar estado de enviados '{path}': {e}")
 
@@ -1189,7 +1458,7 @@ def _status_autenticacao_gmail(base_dir: Path) -> tuple[bool, str]:
     return False, f"Gmail: pronto para autenticar com {creds_file.name}."
 
 
-def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False):
+def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False, interactive: bool = True):
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.credentials import Credentials
@@ -1232,6 +1501,9 @@ def _gmail_service(base_dir: Path, log=print, force_reauth: bool = False):
             except Exception:
                 creds = None
         if not creds:
+            if not interactive:
+                log("Gmail requer autenticacao manual. Abra Configurar pastas e autentique a conta do Gmail.")
+                return None
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_file), scopes)
             creds = flow.run_local_server(port=0)
         token_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1287,14 +1559,173 @@ def _criar_rascunho_gmail(service, assunto: str, corpo: str, anexos: list[Path],
         return None
 
 
-def _nf_enviada_gmail(service, nf: str, log=print) -> bool:
+def _termos_busca_nf_gmail(nf: str, incluir_numero_solto: bool = True) -> list[str]:
+    nf = (nf or "").strip()
+    if not nf:
+        return []
+    termos = [
+        f'subject:"XML PDF NF{nf} + BOLETO"',
+        f'subject:"NF{nf}"',
+        f'subject:"NF {nf}"',
+        f'"NF{nf}"',
+        f'"NF {nf}"',
+    ]
+    if incluir_numero_solto:
+        termos.append(f'"{nf}"')
+    vistos = set()
+    unicos = []
+    for termo in termos:
+        if termo in vistos:
+            continue
+        vistos.add(termo)
+        unicos.append(termo)
+    return unicos
+
+
+def _nf_enviada_gmail(service, nf: str, log=print) -> bool | None:
+    for termo in _termos_busca_nf_gmail(nf, incluir_numero_solto=True):
+        q = f"in:sent {termo}"
+        try:
+            resp = service.users().messages().list(userId="me", q=q, maxResults=1).execute()
+        except Exception as e:
+            log(f"Falha ao consultar enviados no Gmail para NF{nf}: {e}")
+            return None
+        if resp.get("messages"):
+            return True
+    return False
+
+
+def _excluir_rascunhos_gmail(service, nf: str, log=print) -> tuple[int, bool]:
+    draft_ids: set[str] = set()
+    for q in _termos_busca_nf_gmail(nf, incluir_numero_solto=False):
+        page_token = None
+        paginas = 0
+        while paginas < 5:
+            paginas += 1
+            try:
+                req = service.users().drafts().list(userId="me", q=q, maxResults=50)
+                if page_token:
+                    req = service.users().drafts().list(userId="me", q=q, maxResults=50, pageToken=page_token)
+                resp = req.execute()
+            except Exception as e:
+                log(f"Falha ao listar rascunhos Gmail para NF{nf}: {e}")
+                return 0, False
+            for draft in resp.get("drafts", []) or []:
+                draft_id = draft.get("id")
+                if draft_id:
+                    draft_ids.add(draft_id)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    removidos = 0
+    ok = True
+    for draft_id in sorted(draft_ids):
+        try:
+            service.users().drafts().delete(userId="me", id=draft_id).execute()
+            removidos += 1
+        except Exception as e:
+            ok = False
+            log(f"Falha ao excluir rascunho Gmail {draft_id} da NF{nf}: {e}")
+    return removidos, ok
+
+
+def _gmail_header(headers: list[dict] | None, name: str) -> str:
+    for header in headers or []:
+        if (header.get("name") or "").lower() == name.lower():
+            return header.get("value") or ""
+    return ""
+
+
+def _data_rascunho_gmail(message: dict) -> datetime | None:
+    internal_date = str(message.get("internalDate") or "").strip()
+    if internal_date.isdigit():
+        return datetime.fromtimestamp(int(internal_date) / 1000, tz=timezone.utc)
+
+    payload = message.get("payload") or {}
+    date_header = _gmail_header(payload.get("headers"), "Date")
+    if not date_header:
+        return None
     try:
-        q = f'in:sent subject:"XML PDF NF{nf} + BOLETO"'
-        resp = service.users().messages().list(userId="me", q=q, maxResults=1).execute()
-        return bool(resp.get("messages"))
-    except Exception as e:
-        log(f"Falha ao consultar enviados no Gmail para NF{nf}: {e}")
-        return False
+        parsed = parsedate_to_datetime(date_header)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _limpar_rascunhos_gmail(service, max_age_days: int = 5, log=print, status_cb=None) -> dict[str, object]:
+    limite = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    drafts: list[dict] = []
+    page_token = None
+    while True:
+        try:
+            kwargs = {"userId": "me", "maxResults": 100}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            resp = service.users().drafts().list(**kwargs).execute()
+        except Exception as e:
+            log(f"Falha ao listar rascunhos Gmail para limpeza: {e}")
+            return {"ok": False, "checked": len(drafts), "removed": 0, "errors": 1}
+
+        drafts.extend(resp.get("drafts", []) or [])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    removidos = 0
+    erros = 0
+    sem_assunto = 0
+    antigos = 0
+    for idx, draft in enumerate(drafts, start=1):
+        draft_id = draft.get("id")
+        if not draft_id:
+            continue
+        if status_cb:
+            status_cb("Gmail", draft_id, idx, len(drafts), "Verificando rascunho")
+        try:
+            detail = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+        except Exception as e:
+            erros += 1
+            log(f"Falha ao ler rascunho Gmail {draft_id}: {e}")
+            continue
+
+        message = detail.get("message") or {}
+        payload = message.get("payload") or {}
+        assunto = _gmail_header(payload.get("headers"), "Subject").strip()
+        criado_em = _data_rascunho_gmail(message)
+        remover_sem_assunto = not assunto
+        remover_antigo = bool(criado_em and criado_em < limite)
+        if not remover_sem_assunto and not remover_antigo:
+            continue
+
+        motivos = []
+        if remover_sem_assunto:
+            sem_assunto += 1
+            motivos.append("sem assunto")
+        if remover_antigo:
+            antigos += 1
+            dias = (datetime.now(timezone.utc) - criado_em).days if criado_em else max_age_days
+            motivos.append(f"{dias} dia(s) no rascunho")
+
+        try:
+            service.users().drafts().delete(userId="me", id=draft_id).execute()
+            removidos += 1
+            nome = assunto or "(sem assunto)"
+            log(f"Rascunho Gmail removido: {nome} | Motivo: {', '.join(motivos)}")
+        except Exception as e:
+            erros += 1
+            log(f"Falha ao remover rascunho Gmail {draft_id}: {e}")
+
+    return {
+        "ok": erros == 0,
+        "checked": len(drafts),
+        "removed": removidos,
+        "no_subject": sem_assunto,
+        "old": antigos,
+        "errors": erros,
+    }
 
 
 def _cliente_por_bucket(bucket: dict[str, Path]) -> str:
@@ -1318,7 +1749,7 @@ def _cliente_por_bucket(bucket: dict[str, Path]) -> str:
     return "CLIENTE NAO IDENTIFICADO"
 
 
-def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print) -> list[dict]:
+def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print, status_cb=None) -> list[dict]:
     movidos_info = []
     try:
         st = zip_path.stat()
@@ -1332,12 +1763,18 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
     movidos = 0
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
-            for info in zf.infolist():
+            entradas = zf.infolist()
+            total = len([info for info in entradas if not info.is_dir() and (info.filename or "").lower().endswith(".xml")])
+            idx_xml = 0
+            for info in entradas:
                 if info.is_dir():
                     continue
                 nome_interno = info.filename or ""
                 if not nome_interno.lower().endswith(".xml"):
                     continue
+                idx_xml += 1
+                if status_cb:
+                    status_cb("XML em ZIP", Path(nome_interno).name, idx_xml, total, f"Lendo XML em {zip_path.name}")
                 raw = zf.read(info)
                 texto = _ler_texto_bytes(raw)
                 if not texto:
@@ -1361,7 +1798,7 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
     return movidos_info
 
 
-def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print) -> list[dict]:
+def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print, status_cb=None) -> list[dict]:
     movidos_info = []
     try:
         xmls = [p for p in pasta.rglob("*.xml") if p.is_file()]
@@ -1373,7 +1810,9 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
     if dir_key in cache:
         return movidos_info
     movidos = 0
-    for xml_path in xmls:
+    for idx, xml_path in enumerate(xmls, start=1):
+        if status_cb:
+            status_cb("XML em pasta", xml_path, idx, len(xmls), "Lendo XML do pacote")
         try:
             stat = xml_path.stat()
             xml_key = f"{xml_path}|{stat.st_size}|{int(stat.st_mtime)}"
@@ -1405,7 +1844,7 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
     return movidos_info
 
 
-def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print, debug_log=None) -> list[dict]:
+def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva: str, cnpj_horizonte: str, cache: dict, log=print, debug_log=None, status_cb=None) -> list[dict]:
     movidos_info = []
     if not downloads_dir.exists():
         if debug_log:
@@ -1419,23 +1858,27 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
     if debug_log:
         debug_log(f"[XML] Total itens na pasta: {len(itens)}")
 
-    for item in itens:
+    for idx_item, item in enumerate(itens, start=1):
         nome_item = item.name
+        if status_cb and (item.is_dir() or item.is_file()):
+            status_cb("Item XML", item, idx_item, len(itens), "Inspecionando item da pasta XML")
         if item.is_dir() and _eh_pacote_nfes(nome_item):
             if debug_log:
                 debug_log(f"[XML] Pacote de pasta detectado: {item}")
-            movidos_info.extend(_processar_pasta_nfes(item, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log))
+            movidos_info.extend(_processar_pasta_nfes(item, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log, status_cb=status_cb))
         elif item.is_file() and nome_item.lower().endswith(".zip") and _eh_pacote_nfes(nome_item):
             if debug_log:
                 debug_log(f"[XML] Pacote ZIP detectado: {item}")
-            movidos_info.extend(_processar_zip_nfes(item, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log))
+            movidos_info.extend(_processar_zip_nfes(item, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log, status_cb=status_cb))
 
     candidatos = [item.name for item in itens if item.is_file() and item.name.lower().endswith(".xml")]
     if debug_log:
         debug_log(f"[XML] Candidatos XML: {len(candidatos)}")
     agora = time.time()
-    for nome in candidatos:
+    for idx, nome in enumerate(candidatos, start=1):
         caminho = downloads_dir / nome
+        if status_cb:
+            status_cb("XML", caminho, idx, len(candidatos), "Lendo XML")
         try:
             stat = caminho.stat()
             cache_key = f"{caminho}|{stat.st_size}|{int(stat.st_mtime)}"
@@ -1471,7 +1914,7 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
     return movidos_info
 
 
-def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Path, nome_arquivo: str, padrao_regex: str, texto_mva: str, texto_horizonte: str, cache: dict, log=print, debug_log=None) -> list[dict]:
+def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Path, nome_arquivo: str, padrao_regex: str, texto_mva: str, texto_horizonte: str, cache: dict, log=print, debug_log=None, status_cb=None) -> list[dict]:
     movidos_info = []
     if not downloads_dir.exists():
         log(f"Diretório não encontrado: {downloads_dir}")
@@ -1500,8 +1943,10 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
         debug_log(f"[PDF] Candidatos PDF: {len(candidatos)}")
 
     agora = time.time()
-    for nome in candidatos:
+    for idx, nome in enumerate(candidatos, start=1):
         caminho = downloads_dir / nome
+        if status_cb:
+            status_cb("PDF", caminho, idx, len(candidatos), "Lendo PDF")
         try:
             stat = caminho.stat()
             cache_key = f"{caminho}|{stat.st_size}|{int(stat.st_mtime)}"
@@ -1579,6 +2024,7 @@ def processar_boletos(
     workspace_dir: Path | None = None,
     log=print,
     debug_log=None,
+    status_cb=None,
 ) -> list[dict]:
     movidos_info = []
     if not downloads_dir.exists():
@@ -1598,8 +2044,10 @@ def processar_boletos(
     texto_mva = os.getenv("BOLETO_TEXT_MATCH_MVA", "MVA").strip().lower()
     texto_horizonte = os.getenv("BOLETO_TEXT_MATCH_HORIZONTE", "HORIZONTE").strip().lower()
 
-    for nome in candidatos:
+    for idx, nome in enumerate(candidatos, start=1):
         caminho = downloads_dir / nome
+        if status_cb:
+            status_cb("Boleto", caminho, idx, len(candidatos), "Lendo boleto")
         if not caminho.is_file():
             if debug_log:
                 debug_log(f"[BOLETO] Ignorado (nao arquivo): {caminho}")
@@ -1687,58 +2135,88 @@ def _tentar_criar_rascunhos(
     nfs_enviadas: set[str],
     report_state: dict[str, str],
     log=print,
-):
-    for ev in eventos:
-        tipo = ev.get("tipo")
-        nf = (ev.get("nf") or "").strip()
-        path = ev.get("path")
-        if tipo not in {"pdf", "xml", "boleto"} or not nf or not path:
-            continue
-        bucket = estado_nf.setdefault(nf, {})
-        bucket[tipo] = path
+    status_cb=None,
+) -> bool:
+    _atualizar_estado_nf_por_eventos(estado_nf, eventos)
+    _sincronizar_pendencias_trio(base_dir, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
 
     prontas = {}
-    pendentes = {}
     for nf, bucket in list(estado_nf.items()):
-        if nf in nfs_rascunho or nf in nfs_enviadas:
+        if nf in nfs_enviadas and nf not in nfs_rascunho:
             continue
         if {"pdf", "xml", "boleto"}.issubset(bucket.keys()):
             prontas[nf] = bucket
-        else:
-            faltando = {"pdf", "xml", "boleto"} - set(bucket.keys())
-            pendentes[nf] = ", ".join(sorted(faltando))
 
     if not prontas or not service:
-        for nf, faltando in pendentes.items():
-            status = "PENDENTE"
-            motivo = f"Faltando: {faltando}"
-            if report_state.get(nf) != f"{status}|{motivo}":
-                _registrar_relatorio(base_dir, nf, status, motivo, log=log)
-                report_state[nf] = f"{status}|{motivo}"
-        return
+        return service is not None
 
     nao_enviadas = []
     houve_envios = False
-    for nf, bucket in prontas.items():
-        if _nf_enviada_gmail(service, nf, log=log):
+    houve_rascunhos = False
+    gmail_ok = True
+    total_prontas = len(prontas)
+    for idx_nf, (nf, bucket) in enumerate(prontas.items(), start=1):
+        if status_cb:
+            status_cb("Gmail", f"NF{nf}", idx_nf, total_prontas, "Consultando e-mails enviados")
+        if nf in nfs_enviadas:
+            if status_cb:
+                status_cb("Gmail", f"NF{nf}", idx_nf, total_prontas, "Removendo rascunhos já enviados")
+            removidos, limpeza_ok = _excluir_rascunhos_gmail(service, nf, log=log)
+            if not limpeza_ok:
+                gmail_ok = False
+            if limpeza_ok and nf in nfs_rascunho:
+                nfs_rascunho.discard(nf)
+                houve_rascunhos = True
+            if removidos:
+                log(f"Rascunhos removidos para NF{nf}: {removidos}.")
+            continue
+
+        enviada = _nf_enviada_gmail(service, nf, log=log)
+        if enviada is None:
+            gmail_ok = False
+            status = "FALHA AO CONSULTAR ENVIADOS"
+            motivo = "Nao foi possivel confirmar se o e-mail ja foi enviado"
+            if report_state.get(nf) != f"{status}|{motivo}":
+                _registrar_relatorio(base_dir, nf, status, motivo, log=log)
+                report_state[nf] = f"{status}|{motivo}"
+            continue
+
+        if enviada:
+            if status_cb:
+                status_cb("Gmail", f"NF{nf}", idx_nf, total_prontas, "Removendo rascunhos já enviados")
+            removidos, limpeza_ok = _excluir_rascunhos_gmail(service, nf, log=log)
+            if not limpeza_ok:
+                gmail_ok = False
             nfs_enviadas.add(nf)
             status = "JÁ ENVIADO"
-            motivo = "E-mail já enviado"
+            motivo = "E-mail ja enviado"
+            if removidos:
+                motivo = f"{motivo}; {removidos} rascunho(s) removido(s)"
+                log(f"Rascunhos removidos para NF{nf}: {removidos}.")
+            if limpeza_ok and nf in nfs_rascunho:
+                nfs_rascunho.discard(nf)
+                houve_rascunhos = True
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
                 report_state[nf] = f"{status}|{motivo}"
             houve_envios = True
             continue
+        if nf in nfs_rascunho:
+            continue
         nao_enviadas.append((nf, bucket))
 
     if houve_envios:
         _salvar_nfs_enviadas(base_dir, nfs_enviadas, log=log)
+    if houve_rascunhos:
+        _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
 
     if nao_enviadas:
         resumo = ", ".join([f"NF {nf} - {_cliente_por_bucket(bucket)}" for nf, bucket in nao_enviadas])
         log(f"Os seguintes e-mails não foram enviados: {resumo}")
 
-    for nf, bucket in nao_enviadas:
+    for idx_nf, (nf, bucket) in enumerate(nao_enviadas, start=1):
+        if status_cb:
+            status_cb("Gmail", f"NF{nf}", idx_nf, len(nao_enviadas), "Criando rascunho")
         assunto = f"XML PDF NF{nf} + BOLETO"
         corpo = _montar_corpo_email(base_dir, nf)
         anexos = [bucket["xml"], bucket["pdf"], bucket["boleto"]]
@@ -1746,18 +2224,20 @@ def _tentar_criar_rascunhos(
         if draft_id:
             nfs_rascunho.add(nf)
             _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
-            log(f"Rascunho criado para NF{nf} (id={draft_id}).")
+            log(f"Rascunho criado para NF{nf}.")
             status = "RASCUNHO CRIADO"
             motivo = "Rascunho criado com sucesso"
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
                 report_state[nf] = f"{status}|{motivo}"
         else:
+            gmail_ok = False
             status = "FALHA AO CRIAR RASCUNHO"
             motivo = "Falha ao criar rascunho"
             if report_state.get(nf) != f"{status}|{motivo}":
                 _registrar_relatorio(base_dir, nf, status, motivo, log=log)
                 report_state[nf] = f"{status}|{motivo}"
+    return gmail_ok
 
 
 def _coletar_eventos_existentes_mes_atual(
@@ -1765,6 +2245,7 @@ def _coletar_eventos_existentes_mes_atual(
     destinos_xml: list[Path],
     destinos_boleto: list[Path],
     log=print,
+    status_cb=None,
 ) -> list[dict]:
     eventos = []
 
@@ -1772,47 +2253,66 @@ def _coletar_eventos_existentes_mes_atual(
         hoje = datetime.now()
         return base / hoje.strftime("%Y")
 
+    pdfs = []
     for base in destinos_pdf:
         pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
         # PDFs ficam em subpastas de mês; varre o ano inteiro para compor trio entre meses.
-        for p in pasta.rglob("*.pdf"):
-            if not p.is_file():
-                continue
-            nf = _extrair_nf_do_nome(p.name)
-            if nf:
-                eventos.append({"tipo": "pdf", "path": p, "nf": nf})
+        pdfs.extend([p for p in pasta.rglob("*.pdf") if p.is_file()])
+    for idx, p in enumerate(pdfs, start=1):
+        if status_cb:
+            status_cb("PDF arquivado", p, idx, len(pdfs), "Lendo PDF arquivado")
+        nf = _extrair_nf_do_nome(p.name)
+        if nf:
+            eventos.append({"tipo": "pdf", "path": p, "nf": nf})
 
+    boletos = []
     for base in destinos_boleto:
         if not base.exists():
             continue
         # Boletos podem estar em subpastas diferentes (ex.: "02-2026").
-        for p in base.rglob("*.pdf"):
-            if not p.is_file():
-                continue
-            nf = _extrair_nf_do_nome(p.name)
-            if not nf:
-                info = _extrair_info_boleto_pdf(p, log=log)
-                nf = (info.get("nf") or "").strip() or None
-            if nf:
-                eventos.append({"tipo": "boleto", "path": p, "nf": nf})
+        boletos.extend([p for p in base.rglob("*.pdf") if p.is_file()])
+    for idx, p in enumerate(boletos, start=1):
+        if status_cb:
+            status_cb("Boleto arquivado", p, idx, len(boletos), "Lendo boleto arquivado")
+        nf = _extrair_nf_do_nome(p.name)
+        if not nf:
+            info = _extrair_info_boleto_pdf(p, log=log)
+            nf = (info.get("nf") or "").strip() or None
+        if nf:
+            eventos.append({"tipo": "boleto", "path": p, "nf": nf})
 
+    xmls = []
     for base in destinos_xml:
         pasta = pasta_ano_atual(base)
         if not pasta.exists():
             continue
         # XMLs também ficam em subpastas de mês.
-        for p in pasta.rglob("*.xml"):
-            if not p.is_file():
-                continue
-            nf = _extrair_nf_do_nome(p.name)
-            if not nf:
-                txt = _ler_texto_arquivo(p) or ""
-                nf = _extrair_nf_xml_texto(txt)
-            if nf:
-                eventos.append({"tipo": "xml", "path": p, "nf": nf})
+        xmls.extend([p for p in pasta.rglob("*.xml") if p.is_file()])
+    for idx, p in enumerate(xmls, start=1):
+        if status_cb:
+            status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
+        nf = _extrair_nf_do_nome(p.name)
+        if not nf:
+            txt = _ler_texto_arquivo(p) or ""
+            nf = _extrair_nf_xml_texto(txt)
+        if nf:
+            eventos.append({"tipo": "xml", "path": p, "nf": nf})
     return eventos
+
+
+def _tem_nf_pronta_para_gmail(
+    estado_nf: dict[str, dict[str, Path]],
+    nfs_rascunho: set[str],
+    nfs_enviadas: set[str],
+) -> bool:
+    for nf, bucket in estado_nf.items():
+        if not {"pdf", "xml", "boleto"}.issubset(bucket.keys()):
+            continue
+        if nf not in nfs_enviadas or nf in nfs_rascunho:
+            return True
+    return False
 
 
 def _base_dir() -> Path:
@@ -1884,6 +2384,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
             QMessageBox,
             QHBoxLayout,
             QCheckBox,
+            QSpinBox,
         )
         from PySide6.QtCore import Qt
     except Exception as e:
@@ -1924,6 +2425,11 @@ def _abrir_interface_config(base_dir: Path, log=print):
             padding: 8px 10px; color: #ffffff;
         }
         QLineEdit:focus { border: 1px solid #ff9f43; }
+        QSpinBox {
+            background: #3a2418; border: 1px solid #b86a27; border-radius: 8px;
+            padding: 8px 10px; color: #ffffff;
+        }
+        QSpinBox:focus { border: 1px solid #ff9f43; }
         QPushButton.pick {
             background: #5a341d; color: #ffffff; border: 1px solid #b86a27; border-radius: 8px; padding: 8px 10px;
         }
@@ -1979,6 +2485,38 @@ def _abrir_interface_config(base_dir: Path, log=print):
 
     grid.setColumnStretch(1, 1)
     main_layout.addLayout(grid)
+
+    interval_row = QHBoxLayout()
+    interval_row.setSpacing(10)
+    lbl_intervalo = QLabel("Repouso entre ciclos")
+    lbl_intervalo.setProperty("class", "field")
+    spin_intervalo = QSpinBox()
+    spin_intervalo.setRange(1, 3600)
+    spin_intervalo.setSuffix(" s")
+    spin_intervalo.setValue(_config_int(cfg, "scan_interval_seconds", 2, minimo=1, maximo=3600))
+    lbl_intervalo_info = QLabel("Tempo em que a barra fica cheia antes da próxima varredura.")
+    lbl_intervalo_info.setObjectName("subtitle")
+    lbl_intervalo_info.setWordWrap(True)
+    interval_row.addWidget(lbl_intervalo)
+    interval_row.addWidget(spin_intervalo)
+    interval_row.addWidget(lbl_intervalo_info, 1)
+    main_layout.addLayout(interval_row)
+
+    retention_row = QHBoxLayout()
+    retention_row.setSpacing(10)
+    lbl_retention = QLabel("Histórico de logs")
+    lbl_retention.setProperty("class", "field")
+    spin_retention = QSpinBox()
+    spin_retention.setRange(1, 31)
+    spin_retention.setSuffix(" dias")
+    spin_retention.setValue(_config_int(cfg, "log_retention_days", 14, minimo=1, maximo=31))
+    lbl_retention_info = QLabel("Remove linhas antigas e mensagens repetidas dos logs principal e técnico.")
+    lbl_retention_info.setObjectName("subtitle")
+    lbl_retention_info.setWordWrap(True)
+    retention_row.addWidget(lbl_retention)
+    retention_row.addWidget(spin_retention)
+    retention_row.addWidget(lbl_retention_info, 1)
+    main_layout.addLayout(retention_row)
 
     chk_email = QCheckBox("Ativar criacao de rascunho de e-mail")
     chk_email.setChecked((cfg.get("email_enabled", "0").strip() == "1"))
@@ -2077,6 +2615,8 @@ def _abrir_interface_config(base_dir: Path, log=print):
         novo_cfg["email_enabled"] = "1" if chk_email.isChecked() else "0"
         novo_cfg["debug_enabled"] = "1" if chk_debug.isChecked() else "0"
         novo_cfg["auto_update_enabled"] = "1" if chk_update.isChecked() else "0"
+        novo_cfg["scan_interval_seconds"] = str(spin_intervalo.value())
+        novo_cfg["log_retention_days"] = str(spin_retention.value())
         faltantes = [k for k, v in novo_cfg.items() if not v]
         if faltantes:
             QMessageBox.warning(dialog, "Configuração", "Preencha todos os diretórios antes de salvar.")
@@ -2124,13 +2664,15 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             QLabel,
             QHBoxLayout,
             QPushButton,
+            QLineEdit,
             QPlainTextEdit,
             QTabWidget,
             QWidget,
             QCheckBox,
+            QMenu,
         )
-        from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher
-        from PySide6.QtGui import QTextCursor
+        from PySide6.QtCore import Qt, QTimer, QFileSystemWatcher, QObject, QEvent
+        from PySide6.QtGui import QAction, QColor, QTextCharFormat, QTextCursor
     except Exception as e:
         log(f"PySide6 não encontrado para abrir logs: {e}")
         return
@@ -2156,6 +2698,28 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         QPlainTextEdit {
             background: #3a2418; color: #ffffff; border: 1px solid #b86a27;
             border-radius: 8px; padding: 8px; font-family: Consolas, monospace;
+        }
+        QLineEdit {
+            background: #3a2418; border: 1px solid #b86a27; border-radius: 8px;
+            padding: 8px 10px; color: #ffffff;
+        }
+        QLineEdit:focus { border: 1px solid #ff9f43; }
+        QWidget#searchPanel {
+            background: #2a170f; border: 1px solid #b86a27; border-radius: 9px;
+        }
+        QWidget#searchPanel QLineEdit {
+            background: #3a2418; border: 1px solid #b86a27; border-radius: 6px;
+            padding: 3px 7px; color: #ffffff; min-height: 20px;
+        }
+        QWidget#searchPanel QPushButton {
+            background: #4b2b1a; color: #ffffff; border: 0; border-radius: 6px;
+            padding: 3px 7px; font-weight: 700; min-height: 20px;
+        }
+        QWidget#searchPanel QPushButton:hover { background: #ff8a1f; }
+        QWidget#searchPanel QLabel { color: #ffd7b0; font-size: 11px; }
+        QPushButton#alert {
+            color: #ff2d2d; font-size: 22px; font-weight: 900; padding: 0 10px;
+            background: transparent; border: 0;
         }
         QPushButton {
             background: #ff8a1f; color: #ffffff; border: 0; border-radius: 8px;
@@ -2193,8 +2757,82 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     text_debug = QPlainTextEdit()
     text_debug.setReadOnly(True)
     text_debug.setMaximumBlockCount(4000)
-    tabs.addTab(text_main, "Log principal")
-    tabs.addTab(text_debug, "Log técnico (detalhado)")
+    search_controls: dict[str, dict[str, object]] = {}
+    overlay_positioners = []
+
+    class SearchOverlayPositioner(QObject):
+        def __init__(self, edit: QPlainTextEdit, panel: QWidget):
+            super().__init__(edit)
+            self.edit = edit
+            self.panel = panel
+
+        def eventFilter(self, obj, event):
+            if obj is self.edit and event.type() in {QEvent.Resize, QEvent.Show}:
+                self.reposition()
+            return False
+
+        def reposition(self):
+            self.panel.adjustSize()
+            margin = 12
+            width = min(self.panel.sizeHint().width(), max(220, self.edit.width() - (margin * 2)))
+            height = self.panel.sizeHint().height()
+            self.panel.setFixedSize(width, height)
+            self.panel.move(max(margin, self.edit.width() - width - margin), margin)
+            self.panel.raise_()
+
+    def _criar_aba_log(chave: str, text_widget: QPlainTextEdit) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(0)
+        page_layout.addWidget(text_widget)
+
+        panel = QWidget(text_widget)
+        panel.setObjectName("searchPanel")
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(6, 4, 6, 4)
+        panel_layout.setSpacing(4)
+
+        search_input = QLineEdit(panel)
+        search_input.setPlaceholderText("Pesquisar...")
+        search_input.setFixedWidth(165)
+        btn_prev = QPushButton("<", panel)
+        btn_next = QPushButton(">", panel)
+        for btn, tip in ((btn_prev, "Resultado anterior"), (btn_next, "Próximo resultado")):
+            btn.setFixedWidth(30)
+            btn.setToolTip(tip)
+            btn.setFocusPolicy(Qt.NoFocus)
+        lbl_search = QLabel("0/0", panel)
+        lbl_search.setFixedWidth(42)
+        lbl_search.setAlignment(Qt.AlignCenter)
+
+        panel_layout.addWidget(search_input)
+        panel_layout.addWidget(btn_prev)
+        panel_layout.addWidget(btn_next)
+        panel_layout.addWidget(lbl_search)
+        panel.show()
+
+        search_controls[chave] = {
+            "input": search_input,
+            "prev": btn_prev,
+            "next": btn_next,
+            "label": lbl_search,
+            "panel": panel,
+        }
+        positioner = SearchOverlayPositioner(text_widget, panel)
+        text_widget.installEventFilter(positioner)
+        overlay_positioners.append(positioner)
+        positioner.reposition()
+        return page
+
+    tabs.addTab(_criar_aba_log("main", text_main), "Log principal")
+    tabs.addTab(_criar_aba_log("debug", text_debug), "Log técnico (detalhado)")
+
+    alert_button = QPushButton("!")
+    alert_button.setObjectName("alert")
+    alert_button.setToolTip("Clique para ver Pendências de PDF, XML ou BOLETO.")
+    alert_button.setVisible(False)
+    tabs.setCornerWidget(alert_button, Qt.TopRightCorner)
 
     # Aba de configurações do visualizador
     settings_tab = QWidget()
@@ -2246,6 +2884,10 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         "debug": {"path": caminho_debug, "widget": text_debug, "offset": 0, "raw": ""},
     }
     pending_keys: set[str] = set()
+    search_state = {
+        "main": {"term": "", "matches": [], "current": -1},
+        "debug": {"term": "", "matches": [], "current": -1},
+    }
 
     def _formatar_log(texto: str) -> str:
         linhas = []
@@ -2269,6 +2911,101 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             linhas.append(linha)
         return "\n".join(linhas)
 
+    def _chave_log_ativa() -> str | None:
+        idx = tabs.currentIndex()
+        if idx == 0:
+            return "main"
+        if idx == 1:
+            return "debug"
+        return None
+
+    def _limpar_realces_busca(chave: str | None = None):
+        if chave == "main":
+            text_main.setExtraSelections([])
+        elif chave == "debug":
+            text_debug.setExtraSelections([])
+        else:
+            text_main.setExtraSelections([])
+            text_debug.setExtraSelections([])
+
+    def _controle_busca(chave: str | None) -> dict[str, object] | None:
+        if not chave:
+            return None
+        return search_controls.get(chave)
+
+    def _termo_busca(chave: str | None) -> str:
+        controle = _controle_busca(chave)
+        if not controle:
+            return ""
+        return controle["input"].text()
+
+    def _set_label_busca(chave: str | None, texto: str):
+        controle = _controle_busca(chave)
+        if controle:
+            controle["label"].setText(texto)
+
+    def _aplicar_busca(manter_indice: bool = True, chave_override: str | None = None):
+        chave = chave_override or _chave_log_ativa()
+        termo = _termo_busca(chave)
+        _limpar_realces_busca(chave)
+        if not chave or not termo:
+            if chave in search_state:
+                search_state[chave].update({"term": termo, "matches": [], "current": -1})
+            _set_label_busca(chave, "0/0")
+            return
+
+        widget: QPlainTextEdit = estados[chave]["widget"]
+        texto = widget.toPlainText()
+        matches = [m.start() for m in re.finditer(re.escape(termo), texto, re.IGNORECASE)]
+        state = search_state[chave]
+        if not matches:
+            state.update({"term": termo, "matches": [], "current": -1})
+            _set_label_busca(chave, "0/0")
+            return
+
+        current = int(state.get("current", -1))
+        if not manter_indice or state.get("term") != termo or current < 0:
+            current = 0
+        current = min(current, len(matches) - 1)
+
+        fmt_match = QTextCharFormat()
+        fmt_match.setBackground(QColor("#7a5a12"))
+        fmt_current = QTextCharFormat()
+        fmt_current.setBackground(QColor("#ffdd57"))
+        fmt_current.setForeground(QColor("#1f140b"))
+        selections = []
+        for idx_match, start in enumerate(matches):
+            cursor = QTextCursor(widget.document())
+            cursor.setPosition(start)
+            cursor.setPosition(start + len(termo), QTextCursor.KeepAnchor)
+            sel = QPlainTextEdit.ExtraSelection()
+            sel.cursor = cursor
+            sel.format = fmt_current if idx_match == current else fmt_match
+            selections.append(sel)
+        widget.setExtraSelections(selections)
+
+        cursor = QTextCursor(widget.document())
+        cursor.setPosition(matches[current])
+        cursor.setPosition(matches[current] + len(termo), QTextCursor.KeepAnchor)
+        widget.setTextCursor(cursor)
+        widget.ensureCursorVisible()
+        state.update({"term": termo, "matches": matches, "current": current})
+        _set_label_busca(chave, f"{current + 1}/{len(matches)}")
+
+    def _navegar_busca(delta: int, chave_override: str | None = None):
+        chave = chave_override or _chave_log_ativa()
+        termo = _termo_busca(chave)
+        if not chave or not termo:
+            _aplicar_busca(manter_indice=False, chave_override=chave)
+            return
+        state = search_state[chave]
+        if state.get("term") != termo or not state.get("matches"):
+            _aplicar_busca(manter_indice=False, chave_override=chave)
+            return
+        total = len(state["matches"])
+        state["current"] = (int(state["current"]) + delta) % total
+        _aplicar_busca(manter_indice=True, chave_override=chave)
+
     def _renderizar_chave(chave: str, force_bottom: bool = False):
         estado = estados[chave]
         widget: QPlainTextEdit = estado["widget"]
@@ -2286,6 +3023,8 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
                 widget.moveCursor(QTextCursor.End)
             else:
                 bar.setValue(prev_value)
+            if _chave_log_ativa() == chave:
+                _aplicar_busca(manter_indice=True)
         except Exception as e:
             widget.setPlainText(f"Falha ao ler o log: {e}")
 
@@ -2314,6 +3053,46 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
         estado["raw"] = texto
         estado["offset"] = size
         _renderizar_chave(chave, force_bottom=force_bottom)
+
+    def _atualizar_pendencias():
+        pendencias = _pendencias_trio(base_dir, log=log)
+        tem_pendencia = bool(pendencias)
+        if tem_pendencia:
+            alert_button.setVisible(True)
+            alert_timer.start()
+        else:
+            alert_timer.stop()
+            alert_button.setVisible(False)
+
+    def _abrir_menu_pendencias():
+        pendencias = _pendencias_trio(base_dir, log=log)
+        menu = QMenu(alert_button)
+        menu.setStyleSheet("""
+            QMenu { background: #3a2418; color: #ffffff; border: 1px solid #b86a27; }
+            QMenu::item { padding: 7px 14px; }
+            QMenu::item:selected { background: #ff8a1f; color: #ffffff; }
+        """)
+        if not pendencias:
+            action = QAction("Nenhuma NF pendente", menu)
+            action.setEnabled(False)
+            menu.addAction(action)
+        else:
+            title_action = QAction(f"Pendências: {len(pendencias)} NF(s)", menu)
+            title_action.setEnabled(False)
+            menu.addAction(title_action)
+            menu.addSeparator()
+            for item in pendencias[:40]:
+                faltando = ", ".join(item["faltando"]) if item["faltando"] else "Nada identificado"
+                presentes = ", ".join(item["presentes"]) if item["presentes"] else "Nenhum item confirmado"
+                action = QAction(f"NF{item['nf']} | Falta: {faltando} | Já localizado: {presentes}", menu)
+                action.setEnabled(False)
+                menu.addAction(action)
+            if len(pendencias) > 40:
+                menu.addSeparator()
+                extra = QAction(f"+ {len(pendencias) - 40} NF(s) adicionais no relatório", menu)
+                extra.setEnabled(False)
+                menu.addAction(extra)
+        menu.exec(alert_button.mapToGlobal(alert_button.rect().bottomRight()))
 
     def _atualizar_incremental(chave: str):
         estado = estados[chave]
@@ -2347,7 +3126,10 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
             _recarregar_completo(chave)
 
     def carregar_ativos(force_full: bool = False):
+        _atualizar_pendencias()
         if force_full:
+            cfg_atual = _carregar_config(base_dir, log=log)
+            _compactar_logs(base_dir, _config_int(cfg_atual, "log_retention_days", 14, minimo=1, maximo=31))
             _recarregar_completo("main", force_bottom=True)
             _recarregar_completo("debug", force_bottom=True)
             return
@@ -2356,7 +3138,12 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     def abrir_arquivo():
         try:
             idx = tabs.currentIndex()
-            path = caminho_log if idx == 0 else caminho_debug
+            if idx == 0:
+                path = caminho_log
+            elif idx == 1:
+                path = caminho_debug
+            else:
+                path = caminho_log
             if path.exists():
                 os.startfile(str(path))
             else:
@@ -2369,6 +3156,10 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     debounce = QTimer(dialog)
     debounce.setSingleShot(True)
     debounce.setInterval(180)
+
+    alert_timer = QTimer(dialog)
+    alert_timer.setInterval(1500)
+    alert_timer.timeout.connect(lambda: alert_button.setVisible(not alert_button.isVisible()))
 
     def processar_pendencias():
         if chk_pause_refresh.isChecked():
@@ -2428,7 +3219,7 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
 
     timer = QTimer(dialog)
     timer.setInterval(12000)
-    timer.timeout.connect(lambda: agendar_atualizacao({"main", "debug"}))
+    timer.timeout.connect(lambda: (_atualizar_pendencias(), agendar_atualizacao({"main", "debug"})))
     timer.start()
 
     def atualizar_timer():
@@ -2503,14 +3294,24 @@ def _abrir_visualizador_logs(base_dir: Path, log=print):
     btn_open.clicked.connect(abrir_arquivo)
     btn_report.clicked.connect(lambda: _abrir_relatorio(base_dir, log=log))
     btn_close.clicked.connect(dialog.close)
+    alert_button.clicked.connect(_abrir_menu_pendencias)
+    for chave, controle in search_controls.items():
+        controle["next"].clicked.connect(lambda _checked=False, ch=chave: _navegar_busca(1, ch))
+        controle["prev"].clicked.connect(lambda _checked=False, ch=chave: _navegar_busca(-1, ch))
+        controle["input"].textChanged.connect(lambda *_args, ch=chave: _aplicar_busca(False, ch))
+        controle["input"].returnPressed.connect(lambda ch=chave: _navegar_busca(1, ch))
+    tabs.currentChanged.connect(lambda *_: _aplicar_busca(manter_indice=False))
     chk_show_dates.stateChanged.connect(lambda *_: (salvar_viewer(), _renderizar_chave("main"), _renderizar_chave("debug")))
     chk_show_time.stateChanged.connect(lambda *_: (salvar_viewer(), _renderizar_chave("main"), _renderizar_chave("debug")))
     chk_auto_scroll.stateChanged.connect(lambda *_: (salvar_viewer(), carregar_ativos()))
     chk_pause_refresh.stateChanged.connect(lambda *_: (salvar_viewer(), atualizar_timer()))
     btn_clear.clicked.connect(limpar_log)
     dialog.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+    cfg_inicial = _carregar_config(base_dir, log=log)
+    _compactar_logs(base_dir, _config_int(cfg_inicial, "log_retention_days", 14, minimo=1, maximo=31))
     _recarregar_completo("main", force_bottom=True)
     _recarregar_completo("debug", force_bottom=True)
+    _atualizar_pendencias()
     dialog.exec()
 
     if created_app:
@@ -2568,7 +3369,7 @@ def _abrir_status(base_dir: Path, log=print):
 
     dialog = QDialog()
     dialog.setWindowTitle("PdfWatcher - Status")
-    dialog.setMinimumSize(620, 320)
+    dialog.setMinimumSize(760, 430)
     dialog.setModal(False)
     dialog.setStyleSheet("""
         QDialog { background: #2a170f; color: #ffffff; }
@@ -2597,7 +3398,7 @@ def _abrir_status(base_dir: Path, log=print):
 
     title = QLabel("Status do monitor")
     title.setObjectName("title")
-    subtitle = QLabel("Acompanhe a etapa atual, o tempo do último ciclo e quando a pasta será analisada novamente.")
+    subtitle = QLabel("Acompanhe o ciclo atual com etapa, arquivo em análise, progresso e última conclusão.")
     subtitle.setObjectName("subtitle")
     subtitle.setWordWrap(True)
     layout.addWidget(title)
@@ -2621,6 +3422,10 @@ def _abrir_status(base_dir: Path, log=print):
     grid.setHorizontalSpacing(14)
     grid.setVerticalSpacing(8)
     campos = {
+        "item": QLabel("—"),
+        "pasta": QLabel("—"),
+        "progresso": QLabel("—"),
+        "inicio": QLabel("—"),
         "intervalo": QLabel("—"),
         "ciclo": QLabel("—"),
         "fim": QLabel("—"),
@@ -2630,8 +3435,13 @@ def _abrir_status(base_dir: Path, log=print):
     }
     for lbl in campos.values():
         lbl.setObjectName("value")
+        lbl.setWordWrap(True)
 
     itens = [
+        ("Item atual", "item"),
+        ("Pasta atual", "pasta"),
+        ("Progresso da etapa", "progresso"),
+        ("Início do ciclo", "inicio"),
         ("Novo ciclo após", "intervalo"),
         ("Último ciclo", "ciclo"),
         ("Última conclusão", "fim"),
@@ -2662,15 +3472,31 @@ def _abrir_status(base_dir: Path, log=print):
     def carregar():
         status = _carregar_status(base_dir, log=log)
         busy = bool(status.get("busy"))
-        if busy:
-            progress.setRange(0, 0)
-            progress.setFormat("Processando...")
-        else:
-            progress.setRange(0, 100)
-            progress.setValue(100)
-            progress.setFormat("Em espera")
+        progress_percent = int(status.get("progress_percent") or (0 if busy else 100))
+        progress_percent = max(0, min(100, progress_percent))
+        progress_label = str(status.get("progress_label") or ("Em processamento" if busy else "Em repouso"))
+        progress.setRange(0, 100)
+        progress.setValue(progress_percent)
+        progress.setFormat(f"{progress_label} - {progress_percent}%")
         phase.setText(str(status.get("phase") or "Parado"))
         detail.setText(str(status.get("detail") or "Aguardando."))
+        current_file = str(status.get("current_file") or "").strip()
+        current_kind = str(status.get("current_kind") or "").strip()
+        current_index = int(status.get("current_index") or 0)
+        current_total = int(status.get("current_total") or 0)
+        if current_file:
+            item_txt = f"{current_kind}: {current_file}" if current_kind else current_file
+            if current_total:
+                item_txt = f"{item_txt} ({current_index}/{current_total})"
+            campos["item"].setText(item_txt)
+        else:
+            campos["item"].setText("—")
+        campos["pasta"].setText(str(status.get("current_dir") or "—"))
+        if current_total:
+            campos["progresso"].setText(f"{current_index}/{current_total} | {progress_percent}%")
+        else:
+            campos["progresso"].setText(f"{progress_percent}%")
+        campos["inicio"].setText(_formatar_data_status(str(status.get("cycle_started_at") or "")))
         intervalo = int(status.get("scan_interval_seconds") or 0)
         campos["intervalo"].setText(f"{intervalo}s" if intervalo > 0 else "—")
         ciclo = float(status.get("last_cycle_seconds") or 0.0)
@@ -3206,7 +4032,7 @@ def _run_loop(stop_event: threading.Event, log):
     cnpj_mva = os.getenv("XML_CNPJ_MVA", "18471209000107").strip()
     cnpj_horizonte = os.getenv("XML_CNPJ_HORIZONTE", "34636193000193").strip()
     permitir_todos = os.getenv("PDF_ALLOW_ALL", "").strip() == "1"
-    intervalo = int(os.getenv("PDF_POLL_INTERVAL", "2"))
+    intervalo = _config_int(_carregar_config(base_dir, log=log), "scan_interval_seconds", 2, minimo=1, maximo=3600)
 
     log("Monitorando PDFs/XML/BOLETOS (Ctrl+C para sair).")
     if not texto_mva and not texto_horizonte:
@@ -3228,14 +4054,50 @@ def _run_loop(stop_event: threading.Event, log):
     last_state_reload = time.time()
     last_update_check = 0.0
     update_interval = int(os.getenv("UPDATE_CHECK_INTERVAL", "3600"))
+    gmail_retry_interval = max(10, int(os.getenv("GMAIL_RETRY_INTERVAL", "60")))
+    gmail_pending_retry_interval = max(10, int(os.getenv("GMAIL_PENDING_RETRY_INTERVAL", "60")))
+    gmail_cleanup_interval = max(60, int(os.getenv("GMAIL_CLEANUP_INTERVAL", "3600")))
+    gmail_draft_max_age_days = max(1, int(os.getenv("GMAIL_DRAFT_MAX_AGE_DAYS", "5")))
+    existing_scan_interval = max(0, int(os.getenv("PDF_EXISTING_SCAN_INTERVAL", "300")))
+    last_gmail_retry = 0.0
+    last_gmail_pending_attempt = 0.0
+    last_gmail_cleanup = 0.0
+    last_log_cleanup = 0.0
+    last_existing_scan_at = 0.0
     last_existing_scan_seconds = 0.0
+    cycle_started_iso = ""
 
-    def atualizar_status(phase: str, detail: str, busy: bool = True, **extra):
+    def atualizar_status(
+        phase: str,
+        detail: str,
+        busy: bool = True,
+        progress_percent: int | float | None = None,
+        progress_label: str | None = None,
+        current_action: str = "",
+        current_kind: str = "",
+        current_file: str = "",
+        current_dir: str = "",
+        current_index: int = 0,
+        current_total: int = 0,
+        **extra,
+    ):
+        if progress_percent is None:
+            progress_percent = 0 if busy else 100
+        progress_percent = max(0, min(100, int(round(float(progress_percent)))))
         payload = {
             "busy": busy,
             "phase": phase,
             "detail": detail,
+            "progress_percent": progress_percent,
+            "progress_label": progress_label or ("Em processamento" if busy else "Em repouso"),
+            "current_action": current_action,
+            "current_kind": current_kind,
+            "current_file": current_file,
+            "current_dir": current_dir,
+            "current_index": current_index,
+            "current_total": current_total,
             "scan_interval_seconds": intervalo,
+            "cycle_started_at": cycle_started_iso,
             "last_existing_scan_seconds": last_existing_scan_seconds,
         }
         payload.update(extra)
@@ -3243,8 +4105,21 @@ def _run_loop(stop_event: threading.Event, log):
 
     while not stop_event.is_set():
         cycle_started_at = time.perf_counter()
-        atualizar_status("Lendo configuração", "Atualizando pastas observadas e preferências...", busy=True)
+        cycle_started_iso = datetime.now().isoformat(timespec="seconds")
+        atualizar_status(
+            "Lendo configuração",
+            "Atualizando pastas observadas e preferências...",
+            busy=True,
+            progress_percent=0,
+            progress_label="Início do ciclo",
+            current_action="Lendo configuração",
+        )
         cfg = _carregar_config(base_dir, log=log)
+        intervalo = _config_int(cfg, "scan_interval_seconds", 2, minimo=1, maximo=3600)
+        log_retention_days = _config_int(cfg, "log_retention_days", 14, minimo=1, maximo=31)
+        if time.time() - last_log_cleanup >= 3600:
+            _compactar_logs(base_dir, log_retention_days)
+            last_log_cleanup = time.time()
         origem_pdf = Path(cfg["pdf_watch_dir"])
         origem_xml = Path(cfg["xml_watch_dir"])
         origem_boleto = Path(cfg["boleto_watch_dir"])
@@ -3257,6 +4132,66 @@ def _run_loop(stop_event: threading.Event, log):
         debug_ativo_novo = (cfg.get("debug_enabled", "0").strip() == "1")
         debug_log = inner_debug if debug_ativo_novo else None
         eventos = []
+        historico_revisado_no_ciclo = False
+
+        def status_item(
+            stage_start: int,
+            stage_end: int,
+            kind: str,
+            item,
+            index: int,
+            total: int,
+            action: str,
+            phase_name: str,
+        ):
+            total_seguro = max(1, int(total or 0))
+            index_seguro = max(0, min(int(index or 0), total_seguro))
+            pct = stage_start + ((stage_end - stage_start) * index_seguro / total_seguro)
+            if isinstance(item, Path):
+                current_file = item.name
+                current_dir = str(item.parent)
+            else:
+                current_file = str(item or "")
+                current_dir = ""
+            detail = f"{action}: {current_file}" if current_file else action
+            atualizar_status(
+                phase_name,
+                detail,
+                busy=True,
+                progress_percent=pct,
+                progress_label=f"{kind} {index_seguro}/{total_seguro}",
+                current_action=action,
+                current_kind=kind,
+                current_file=current_file,
+                current_dir=current_dir,
+                current_index=index_seguro,
+                current_total=total_seguro,
+            )
+
+        def coletar_eventos_existentes(detalhe: str) -> list[dict]:
+            nonlocal last_existing_scan_at, last_existing_scan_seconds, historico_revisado_no_ciclo
+            atualizar_status(
+                "Sincronizando histórico",
+                detalhe,
+                busy=True,
+                progress_percent=5,
+                progress_label="Histórico",
+                current_action="Lendo arquivos arquivados",
+            )
+            existing_scan_started = time.perf_counter()
+            coletados = _coletar_eventos_existentes_mes_atual(
+                [destino_mva, destino_horizonte],
+                [destinos_xml["MVA"], destinos_xml["HORIZONTE"]],
+                [destino_boleto_mva, destino_boleto_horizonte],
+                log=log,
+                status_cb=lambda kind, path, idx, total, action: status_item(
+                    5, 15, kind, path, idx, total, action, "Sincronizando histórico"
+                ),
+            )
+            last_existing_scan_seconds = round(time.perf_counter() - existing_scan_started, 3)
+            last_existing_scan_at = time.time()
+            historico_revisado_no_ciclo = True
+            return coletados
 
         nova_assinatura = (
             str(origem_pdf),
@@ -3287,6 +4222,7 @@ def _run_loop(stop_event: threading.Event, log):
                 debug_log(f"[CFG] Destino BOLETO MVA: {destino_boleto_mva}")
                 debug_log(f"[CFG] Destino BOLETO HORIZONTE: {destino_boleto_horizonte}")
             if email_ativo_novo and not email_ativo:
+                last_gmail_retry = time.time()
                 gmail_service = _gmail_service(base_dir, log=log)
                 if gmail_service:
                     log("Integração Gmail pronta. Rascunhos serão criados quando houver XML+PDF+BOLETO da mesma NF.")
@@ -3294,21 +4230,12 @@ def _run_loop(stop_event: threading.Event, log):
                     log("Gmail indisponível no momento. O monitoramento de arquivos seguirá normalmente.")
             if not email_ativo_novo:
                 gmail_service = None
+                last_gmail_pending_attempt = 0.0
             email_ativo = email_ativo_novo
             debug_ativo = debug_ativo_novo
             # Ao iniciar (ou ao trocar configuração), tenta compor trio PDF/XML/BOLETO
             # já existente nas pastas de destino do mês atual.
-            atualizar_status("Sincronizando histórico", "Lendo arquivos já existentes nas pastas de destino...", busy=True)
-            existing_scan_started = time.perf_counter()
-            eventos.extend(
-                _coletar_eventos_existentes_mes_atual(
-                    [destino_mva, destino_horizonte],
-                    [destinos_xml["MVA"], destinos_xml["HORIZONTE"]],
-                    [destino_boleto_mva, destino_boleto_horizonte],
-                    log=log,
-                )
-            )
-            last_existing_scan_seconds = round(time.perf_counter() - existing_scan_started, 3)
+            eventos.extend(coletar_eventos_existentes("Lendo arquivos já existentes nas pastas de destino..."))
 
         if debug_log:
             def _count_dir(path: Path) -> int:
@@ -3321,10 +4248,35 @@ def _run_loop(stop_event: threading.Event, log):
             debug_log(f"[LOOP] origem XML itens: {_count_dir(origem_xml)}")
             debug_log(f"[LOOP] origem BOLETO itens: {_count_dir(origem_boleto)}")
 
-        atualizar_status("Analisando PDFs", f"Lendo PDFs em {origem_pdf}...", busy=True)
+        atualizar_status(
+            "Analisando PDFs",
+            f"Lendo PDFs em {origem_pdf}...",
+            busy=True,
+            progress_percent=15,
+            progress_label="PDF",
+            current_action="Listando PDFs",
+            current_kind="PDF",
+            current_dir=str(origem_pdf),
+        )
         if origem_pdf.exists():
             if permitir_todos or texto_mva or texto_horizonte:
-                eventos.extend(processar_pdfs(origem_pdf, destino_mva, destino_horizonte, nome_arquivo, padrao_regex, texto_mva, texto_horizonte, cache, log=log, debug_log=debug_log))
+                eventos.extend(
+                    processar_pdfs(
+                        origem_pdf,
+                        destino_mva,
+                        destino_horizonte,
+                        nome_arquivo,
+                        padrao_regex,
+                        texto_mva,
+                        texto_horizonte,
+                        cache,
+                        log=log,
+                        debug_log=debug_log,
+                        status_cb=lambda kind, path, idx, total, action: status_item(
+                            15, 35, kind, path, idx, total, action, "Analisando PDFs"
+                        ),
+                    )
+                )
         else:
             chave_pdf = ("PDF", origem_pdf)
             if chave_pdf not in avisados:
@@ -3333,9 +4285,31 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log(f"[PDF] Diretório não encontrado: {origem_pdf}")
 
-        atualizar_status("Analisando XMLs", f"Lendo XMLs em {origem_xml}...", busy=True)
+        atualizar_status(
+            "Analisando XMLs",
+            f"Lendo XMLs em {origem_xml}...",
+            busy=True,
+            progress_percent=35,
+            progress_label="XML",
+            current_action="Listando XMLs",
+            current_kind="XML",
+            current_dir=str(origem_xml),
+        )
         if origem_xml.exists():
-            eventos.extend(processar_xmls(origem_xml, destinos_xml, cnpj_mva, cnpj_horizonte, cache, log=log, debug_log=debug_log))
+            eventos.extend(
+                processar_xmls(
+                    origem_xml,
+                    destinos_xml,
+                    cnpj_mva,
+                    cnpj_horizonte,
+                    cache,
+                    log=log,
+                    debug_log=debug_log,
+                    status_cb=lambda kind, path, idx, total, action: status_item(
+                        35, 55, kind, path, idx, total, action, "Analisando XMLs"
+                    ),
+                )
+            )
         else:
             chave_xml = ("XML", origem_xml)
             if chave_xml not in avisados:
@@ -3344,7 +4318,16 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log(f"[XML] Diretório não encontrado: {origem_xml}")
 
-        atualizar_status("Analisando boletos", f"Lendo boletos em {origem_boleto}...", busy=True)
+        atualizar_status(
+            "Analisando boletos",
+            f"Lendo boletos em {origem_boleto}...",
+            busy=True,
+            progress_percent=55,
+            progress_label="Boleto",
+            current_action="Listando boletos",
+            current_kind="Boleto",
+            current_dir=str(origem_boleto),
+        )
         if origem_boleto.exists():
             eventos.extend(
                 processar_boletos(
@@ -3357,6 +4340,9 @@ def _run_loop(stop_event: threading.Event, log):
                     workspace_dir=base_dir,
                     log=log,
                     debug_log=debug_log,
+                    status_cb=lambda kind, path, idx, total, action: status_item(
+                        55, 75, kind, path, idx, total, action, "Analisando boletos"
+                    ),
                 )
             )
         else:
@@ -3367,8 +4353,22 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log(f"[BOLETO] Diretório não encontrado: {origem_boleto}")
 
+        if (
+            email_ativo_novo
+            and existing_scan_interval > 0
+            and time.time() - last_existing_scan_at >= existing_scan_interval
+        ):
+            eventos.extend(coletar_eventos_existentes("Revisando NFs já arquivadas nas pastas de destino..."))
+
         if time.time() - last_state_reload >= 300:
-            atualizar_status("Atualizando estado", "Relendo rascunhos, enviados e relatório...", busy=True)
+            atualizar_status(
+                "Atualizando estado",
+                "Relendo rascunhos, enviados e relatório...",
+                busy=True,
+                progress_percent=76,
+                progress_label="Estado",
+                current_action="Relendo arquivos de estado",
+            )
             nfs_rascunho = _carregar_nfs_rascunho(base_dir, log=log)
             nfs_enviadas = _carregar_nfs_enviadas(base_dir, log=log)
             report_state = _carregar_report_state(base_dir, log=log)
@@ -3376,16 +4376,113 @@ def _run_loop(stop_event: threading.Event, log):
             if debug_log:
                 debug_log("[LOOP] Estado recarregado (rascunhos/enviados/relatorio).")
 
+        if _tem_pendencias_report_state(report_state) and not historico_revisado_no_ciclo:
+            eventos.extend(coletar_eventos_existentes("Atualizando Pendências com arquivos já corrigidos..."))
+
         if (cfg.get("auto_update_enabled", "1").strip() == "1") and (time.time() - last_update_check >= update_interval):
             last_update_check = time.time()
-            atualizar_status("Verificando atualização", "Consultando a versão mais recente...", busy=True)
+            atualizar_status(
+                "Verificando atualização",
+                "Consultando a versão mais recente...",
+                busy=True,
+                progress_percent=80,
+                progress_label="Atualização",
+                current_action="Consultando GitHub Releases",
+            )
             if _verificar_atualizacao_github(base_dir, log=log, prompt=False, notify=False):
                 log("Atualização iniciada. Encerrando o aplicativo...")
                 os._exit(0)
 
-        if eventos:
-            atualizar_status("Criando rascunhos", "Compondo NFs prontas para envio...", busy=True)
-            _tentar_criar_rascunhos(base_dir, gmail_service, eventos, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log)
+        if email_ativo_novo and gmail_service is None and time.time() - last_gmail_retry >= gmail_retry_interval:
+            last_gmail_retry = time.time()
+            atualizar_status(
+                "Reconectando Gmail",
+                "Tentando restaurar a integração sem reiniciar...",
+                busy=True,
+                progress_percent=84,
+                progress_label="Gmail",
+                current_action="Reconectando Gmail",
+            )
+            gmail_service = _gmail_service(base_dir, log=log, interactive=False)
+            if gmail_service:
+                log("Integração Gmail reconectada. Pendências serão processadas automaticamente.")
+
+        if (
+            email_ativo_novo
+            and gmail_service
+            and time.time() - last_gmail_cleanup >= gmail_cleanup_interval
+        ):
+            last_gmail_cleanup = time.time()
+            atualizar_status(
+                "Limpando rascunhos Gmail",
+                "Removendo rascunhos sem assunto ou antigos...",
+                busy=True,
+                progress_percent=84,
+                progress_label="Limpeza Gmail",
+                current_action="Limpando rascunhos Gmail",
+            )
+            limpeza = _limpar_rascunhos_gmail(
+                gmail_service,
+                max_age_days=gmail_draft_max_age_days,
+                log=log,
+                status_cb=lambda kind, item, idx, total, action: status_item(
+                    84, 85, kind, item, idx, total, action, "Limpando rascunhos Gmail"
+                ),
+            )
+            if limpeza.get("removed"):
+                log(
+                    "Limpeza Gmail concluída: "
+                    f"{limpeza.get('removed')} removido(s), "
+                    f"{limpeza.get('no_subject')} sem assunto, "
+                    f"{limpeza.get('old')} antigo(s)."
+                )
+            if not limpeza.get("ok", False):
+                gmail_service = None
+                last_gmail_retry = 0.0
+                last_gmail_pending_attempt = 0.0
+
+        _atualizar_estado_nf_por_eventos(estado_nf, eventos)
+        if _sincronizar_pendencias_trio(base_dir, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log):
+            _salvar_report_state(base_dir, report_state, log=log)
+
+        tem_gmail_pendente = _tem_nf_pronta_para_gmail(estado_nf, nfs_rascunho, nfs_enviadas)
+        deve_processar_gmail = bool(eventos)
+        if (
+            not deve_processar_gmail
+            and gmail_service
+            and tem_gmail_pendente
+            and time.time() - last_gmail_pending_attempt >= gmail_pending_retry_interval
+        ):
+            deve_processar_gmail = True
+
+        if deve_processar_gmail:
+            if gmail_service:
+                last_gmail_pending_attempt = time.time()
+            atualizar_status(
+                "Criando rascunhos",
+                "Compondo NFs prontas para envio...",
+                busy=True,
+                progress_percent=85,
+                progress_label="Gmail",
+                current_action="Preparando rascunhos",
+            )
+            gmail_ok = _tentar_criar_rascunhos(
+                base_dir,
+                gmail_service,
+                eventos,
+                estado_nf,
+                nfs_rascunho,
+                nfs_enviadas,
+                report_state,
+                log=log,
+                status_cb=lambda kind, item, idx, total, action: status_item(
+                    85, 98, kind, item, idx, total, action, "Criando rascunhos"
+                ),
+            )
+            if email_ativo_novo and not gmail_ok:
+                gmail_service = None
+                last_gmail_retry = 0.0
+                last_gmail_pending_attempt = 0.0
             _salvar_report_state(base_dir, report_state, log=log)
         elif debug_log:
             debug_log("[LOOP] Nenhum evento gerado neste ciclo.")
@@ -3401,6 +4498,14 @@ def _run_loop(stop_event: threading.Event, log):
             "Aguardando",
             f"Próxima varredura em {intervalo}s.",
             busy=False,
+            progress_percent=100,
+            progress_label="Em repouso",
+            current_action="Aguardando próximo ciclo",
+            current_kind="",
+            current_file="",
+            current_dir="",
+            current_index=0,
+            current_total=0,
             last_cycle_seconds=cycle_seconds,
             last_cycle_finished_at=datetime.now().isoformat(timespec="seconds"),
             last_events_total=len(eventos),
@@ -3414,6 +4519,7 @@ def _run_loop(stop_event: threading.Event, log):
                 f"PDF {pdf_events} | XML {xml_events} | BOLETO {boleto_events} | "
                 f"próxima varredura em {intervalo}s."
             )
+        stop_event.wait(intervalo)
 
 # Lógica da Beatrice Review
 
@@ -3435,8 +4541,9 @@ def _carregar_undo_history(base_dir: Path, log=print) -> list:
 def _salvar_undo_history(base_dir: Path, history: list, log=print):
     path = _undo_history_path(base_dir)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+        ok, erro = _gravar_texto_resiliente(path, json.dumps(history, indent=2, ensure_ascii=False))
+        if not ok:
+            _log_falha_gravacao_estado("histórico de undo", path, erro, log=log)
     except Exception as e:
         log(f"Falha ao salvar histórico de undo: {e}")
 

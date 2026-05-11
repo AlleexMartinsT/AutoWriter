@@ -18,16 +18,25 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 ## Melhorias recentes
 
 - A tela de configuração agora possui botão para selecionar, autenticar ou reautenticar o Gmail manualmente.
+- Antes de criar rascunho, o Gmail agora é consultado pelo número da NF nos e-mails enviados; se já houver envio, a NF é marcada como enviada e rascunhos correspondentes são removidos.
+- Rascunhos do Gmail sem assunto ou com mais de 5 dias no rascunho também são removidos pela limpeza automática.
+- A integração Gmail passa a tentar reconectar e reprocessar pendências automaticamente, sem depender de desligar e ligar o aplicativo.
 - Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.
 - O fluxo de `BOLETO` deixou de poluir o log com PDFs que não são boleto.
 - Foi adicionada uma janela de `Status` com:
   - etapa atual
+  - arquivo e pasta em análise
+  - progresso finito do ciclo atual
   - detalhe do que está sendo analisado
   - duração do último ciclo
   - intervalo até a próxima varredura
   - contagem de eventos `PDF/XML/BOLETO`
+- A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque e navegação por resultado.
+- Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
+- Os logs principal e técnico são compactados automaticamente: linhas antigas são removidas e mensagens repetidas são filtradas.
+- Arquivos internos de estado agora são gravados com temporário único, retentativas e fallback para reduzir erro de `Acesso negado` no Windows quando há concorrência entre janelas/processos.
 - A verificação manual de atualização passou a abrir em subprocesso próprio, para evitar popup “travado”.
 
 ## Como o ciclo funciona
@@ -39,9 +48,10 @@ O loop principal faz isto:
 3. Analisa a pasta de XMLs.
 4. Analisa a pasta de boletos.
 5. Tenta montar trios por NF para criar rascunhos.
-6. Aguarda o próximo ciclo.
+6. Reprocessa pendências de Gmail e remove rascunhos de NFs já enviadas.
+7. Aguarda o próximo ciclo.
 
-Por padrão, o próximo ciclo começa após `2` segundos. Esse valor pode ser alterado pela variável de ambiente `PDF_POLL_INTERVAL`.
+Por padrão, o próximo ciclo começa após `2` segundos. Esse valor pode ser alterado em `Configurar pastas`, no campo `Repouso entre ciclos`. A variável de ambiente `PDF_POLL_INTERVAL` ainda pode sobrescrever esse valor quando definida.
 
 ## Requisitos
 
@@ -134,7 +144,13 @@ Por padrão:
 - `PDF_ALLOW_ALL`
 - `PDF_POLL_INTERVAL`
 - `PDF_CACHE_TTL`
+- `PDF_EXISTING_SCAN_INTERVAL`
 - `PDF_STABLE_AGE_SECONDS`
+- `PDF_LOG_RETENTION_DAYS`
+- `GMAIL_RETRY_INTERVAL`
+- `GMAIL_PENDING_RETRY_INTERVAL`
+- `GMAIL_CLEANUP_INTERVAL`
+- `GMAIL_DRAFT_MAX_AGE_DAYS`
 - `PDF_LOG_PATH`
 - `PDF_DEBUG_LOG_PATH`
 - `PDF_REPORT_PATH`
