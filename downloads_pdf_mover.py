@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -1470,12 +1470,16 @@ def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
     ind_pags = [valor.strip() for valor in re.findall(r"<indPag>\s*([^<]+?)\s*</indPag>", conteudo, re.IGNORECASE)]
     t_pags = [valor.strip() for valor in re.findall(r"<tPag>\s*([^<]+?)\s*</tPag>", conteudo, re.IGNORECASE)]
     x_pags = [valor.strip() for valor in re.findall(r"<xPag>\s*([^<]+?)\s*</xPag>", conteudo, re.IGNORECASE)]
+    natureza = _extrair_natureza_operacao_xml(conteudo)
     tem_cobr = bool(re.search(r"<cobr\b", conteudo, re.IGNORECASE))
     tem_dup = bool(re.search(r"<dup\b", conteudo, re.IGNORECASE))
     tem_card = bool(re.search(r"<card\b", conteudo, re.IGNORECASE))
 
     x_pags_upper = [valor.upper() for valor in x_pags]
     t_pags_set = set(t_pags)
+    natureza_norm = _normalizar_texto_busca(natureza)
+    natureza_a_vista = "A VISTA" in natureza_norm or "AVISTA" in natureza_norm
+    natureza_a_prazo = "A PRAZO" in natureza_norm or "APRAZO" in natureza_norm
 
     a_vista = any(valor == "0" for valor in ind_pags)
     if not a_vista and any(marcador in valor for valor in x_pags_upper for marcador in _XPAG_A_VISTA_MARKERS):
@@ -1486,6 +1490,12 @@ def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
         a_vista = True
     if not a_vista and not ind_pags and t_pags and set(t_pags).issubset(_TPAG_A_VISTA_FALLBACK) and not tem_cobr and not tem_dup:
         a_vista = True
+    if not a_vista and natureza_a_vista and not natureza_a_prazo:
+        sem_boleto_explicito = "15" not in t_pags_set and not any("BOLETO" in valor for valor in x_pags_upper)
+        tpag_compativel = not t_pags_set or t_pags_set.issubset(_TPAG_SEM_BOLETO_EXPLICITO | {"05", "90"})
+        sem_cobranca_real = not tem_dup
+        if sem_boleto_explicito and (tpag_compativel or sem_cobranca_real):
+            a_vista = True
 
     if "15" in t_pags_set or any("BOLETO" in valor for valor in x_pags_upper):
         a_vista = False
@@ -1493,6 +1503,7 @@ def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
     return {
         "a_vista": a_vista,
         "boleto_required": not a_vista,
+        "natureza": natureza,
         "ind_pags": ind_pags,
         "t_pags": t_pags,
         "x_pags": x_pags,
