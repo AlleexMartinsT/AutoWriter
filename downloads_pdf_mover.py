@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -1386,6 +1386,66 @@ def _nome_xml_por_id(texto: str | None, fallback_nome: str) -> str:
     return base_nome
 
 
+def _normalizar_texto_busca(valor: str | None) -> str:
+    return re.sub(r"\s+", " ", _normalizar_nome_arquivo(valor or "").upper()).strip()
+
+
+def _natureza_indica_devolucao(valor: str | None) -> bool:
+    return "DEVOL" in _normalizar_texto_busca(valor)
+
+
+def _extrair_natureza_operacao_xml(texto: str | None) -> str:
+    m = re.search(r"<natOp>\s*([^<]+?)\s*</natOp>", texto or "", re.IGNORECASE)
+    if not m:
+        return ""
+    return re.sub(r"\s+", " ", m.group(1)).strip()
+
+
+def _xml_deve_ser_ignorado(texto: str | None) -> tuple[bool, str]:
+    conteudo = texto or ""
+    natureza = _extrair_natureza_operacao_xml(conteudo)
+    if _natureza_indica_devolucao(natureza):
+        return True, f"Natureza da operacao: {natureza}"
+
+    m_fin = re.search(r"<finNFe>\s*([^<]+?)\s*</finNFe>", conteudo, re.IGNORECASE)
+    fin_nfe = (m_fin.group(1).strip() if m_fin else "")
+    if fin_nfe == "4":
+        return True, "Finalidade da NF-e: devolucao (finNFe=4)"
+    return False, ""
+
+
+def _extrair_natureza_operacao_pdf(texto: str | None) -> str:
+    linhas = [ln.strip() for ln in (texto or "").splitlines() if ln.strip()]
+    for i, linha in enumerate(linhas):
+        if "NATUREZA DA OPERACAO" not in _normalizar_texto_busca(linha):
+            continue
+        for proxima in linhas[i + 1:i + 5]:
+            proxima_norm = _normalizar_texto_busca(proxima)
+            if not proxima_norm:
+                continue
+            if any(
+                marcador in proxima_norm
+                for marcador in ("PROTOCOLO DE AUTORIZACAO", "CHAVE DE ACESSO", "INSCRICAO ESTADUAL")
+            ):
+                break
+            return re.sub(r"\s+", " ", proxima).strip()
+
+    conteudo_norm = _normalizar_texto_busca(texto)
+    m = re.search(
+        r"NATUREZA DA OPERACAO\s+(.+?)\s+(?:PROTOCOLO DE AUTORIZACAO DE USO|INSCRICAO ESTADUAL|CHAVE DE ACESSO)",
+        conteudo_norm,
+        re.IGNORECASE,
+    )
+    return (m.group(1).strip() if m else "")
+
+
+def _pdf_deve_ser_ignorado(texto: str | None) -> tuple[bool, str]:
+    natureza = _extrair_natureza_operacao_pdf(texto)
+    if _natureza_indica_devolucao(natureza):
+        return True, f"Natureza da operacao: {natureza}"
+    return False, ""
+
+
 _TPAG_A_VISTA_FALLBACK = {
     "01", "02", "03", "04", "10", "11", "12", "13", "14", "16", "17", "18", "19",
 }
@@ -1459,6 +1519,123 @@ def _tipos_necessarios_bucket(bucket: dict[str, object]) -> set[str]:
     if _bucket_exige_boleto(bucket):
         tipos.add("boleto")
     return tipos
+
+
+def _bucket_gera_rascunho_automatico(bucket: dict[str, object]) -> bool:
+    # NF a vista nao deve abrir rascunho automatico; so trios com boleto entram no Gmail.
+    return _bucket_exige_boleto(bucket)
+
+
+def _nfs_ignoradas_por_eventos(eventos: list[dict]) -> dict[str, str]:
+    ignoradas: dict[str, str] = {}
+    for ev in eventos:
+        if str(ev.get("tipo") or "").strip().lower() != "ignorada":
+            continue
+        nf = str(ev.get("nf") or "").strip()
+        if not nf:
+            continue
+        motivo = str(ev.get("reason") or ev.get("motivo") or "NF ignorada").strip() or "NF ignorada"
+        ignoradas[nf] = motivo
+    return ignoradas
+
+
+def _conciliar_nfs_ignoradas(
+    base_dir: Path,
+    ignored_nfs: dict[str, str],
+    estado_nf: dict[str, dict[str, Path]],
+    nfs_rascunho: set[str],
+    report_state: dict[str, str],
+    log=print,
+    gmail_service=None,
+) -> tuple[bool, bool]:
+    if not ignored_nfs:
+        return False, True
+
+    mudou = False
+    houve_rascunhos = False
+    gmail_ok = True
+    for nf, motivo in sorted(
+        ignored_nfs.items(),
+        key=lambda item: _nf_numero(item[0]) if _nf_numero(item[0]) is not None else item[0],
+    ):
+        if nf in estado_nf:
+            estado_nf.pop(nf, None)
+            mudou = True
+        if nf in report_state:
+            report_state.pop(nf, None)
+            mudou = True
+        if nf in nfs_rascunho:
+            pode_limpar_estado_local = True
+            if gmail_service is not None:
+                removidos, limpeza_ok = _excluir_rascunhos_gmail(gmail_service, nf, log=log)
+                if not limpeza_ok:
+                    gmail_ok = False
+                    pode_limpar_estado_local = False
+                if removidos:
+                    log(f"Rascunhos removidos para NF{nf}: {removidos}.")
+            if pode_limpar_estado_local:
+                nfs_rascunho.discard(nf)
+                houve_rascunhos = True
+                mudou = True
+        log(f"NF{nf} ignorada por devolucao. {motivo}.")
+
+    if houve_rascunhos:
+        _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
+    return mudou, gmail_ok
+
+
+def _conciliar_rascunhos_bloqueados(
+    base_dir: Path,
+    estado_nf: dict[str, dict[str, Path]],
+    nfs_rascunho: set[str],
+    report_state: dict[str, str],
+    log=print,
+    gmail_service=None,
+) -> tuple[bool, bool]:
+    mudou = False
+    houve_rascunhos = False
+    gmail_ok = True
+
+    for nf, bucket in sorted(
+        estado_nf.items(),
+        key=lambda item: _nf_numero(item[0]) if _nf_numero(item[0]) is not None else item[0],
+    ):
+        if _bucket_gera_rascunho_automatico(bucket):
+            continue
+
+        status_atual = _report_status(report_state.get(nf))
+        possui_rascunho_local = nf in nfs_rascunho
+        if not possui_rascunho_local and status_atual != "RASCUNHO CRIADO":
+            continue
+
+        motivo = "NF a vista nao gera rascunho automatico"
+        pode_limpar_estado_local = True
+        if possui_rascunho_local:
+            if gmail_service is not None:
+                removidos, limpeza_ok = _excluir_rascunhos_gmail(gmail_service, nf, log=log)
+                if not limpeza_ok:
+                    gmail_ok = False
+                    pode_limpar_estado_local = False
+                if removidos:
+                    log(f"Rascunhos removidos para NF{nf}: {removidos}.")
+            else:
+                pode_limpar_estado_local = False
+
+        if pode_limpar_estado_local and possui_rascunho_local:
+            nfs_rascunho.discard(nf)
+            houve_rascunhos = True
+            mudou = True
+
+        if pode_limpar_estado_local and status_atual == "RASCUNHO CRIADO":
+            report_state.pop(nf, None)
+            mudou = True
+
+        if pode_limpar_estado_local:
+            log(f"NF{nf} retirada do Gmail automatico. {motivo}.")
+
+    if houve_rascunhos:
+        _salvar_nfs_rascunho(base_dir, nfs_rascunho, log=log)
+    return mudou, gmail_ok
 
 
 def _extrair_dados_nf(texto: str) -> tuple[str | None, str | None]:
@@ -2159,6 +2336,19 @@ def _processar_zip_nfes(zip_path: Path, destinos_xml: dict[str, Path], cnpj_mva:
                 if not destino_base:
                     continue
                 nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome_interno)
+                ignorar_xml, motivo_ignorar = _xml_deve_ser_ignorado(texto)
+                if ignorar_xml:
+                    if nf:
+                        grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+                        movidos_info.append({
+                            "tipo": "ignorada",
+                            "nf": nf,
+                            "grupo": grupo,
+                            "path": zip_path,
+                            "reason": motivo_ignorar,
+                        })
+                    log(f"XML ignorado por devolucao em {zip_path.name}: {Path(nome_interno).name}")
+                    continue
                 pagamento = _resumo_pagamento_xml(texto)
                 destino_dir = criar_pasta_data(destino_base)
                 salvo = _salvar_xml_bytes(destino_dir, Path(nome_interno).name, raw, log=log, xml_texto=texto)
@@ -2216,6 +2406,20 @@ def _processar_pasta_nfes(pasta: Path, destinos_xml: dict[str, Path], cnpj_mva: 
             cache[xml_key] = time.time()
             continue
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(xml_path.name)
+        ignorar_xml, motivo_ignorar = _xml_deve_ser_ignorado(texto)
+        if ignorar_xml:
+            grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+            if nf:
+                movidos_info.append({
+                    "tipo": "ignorada",
+                    "nf": nf,
+                    "grupo": grupo,
+                    "path": xml_path,
+                    "reason": motivo_ignorar,
+                })
+            log(f"XML ignorado por devolucao: {xml_path.name}")
+            cache[xml_key] = time.time()
+            continue
         pagamento = _resumo_pagamento_xml(texto)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
@@ -2299,6 +2503,22 @@ def processar_xmls(downloads_dir: Path, destinos_xml: dict[str, Path], cnpj_mva:
             cache[cache_key] = agora
             continue
         nf = _extrair_nf_xml_texto(texto) or _extrair_nf_do_nome(nome)
+        ignorar_xml, motivo_ignorar = _xml_deve_ser_ignorado(texto)
+        if ignorar_xml:
+            grupo = "HORIZONTE" if destino_base == destinos_xml["HORIZONTE"] else "MVA"
+            if nf:
+                movidos_info.append({
+                    "tipo": "ignorada",
+                    "nf": nf,
+                    "grupo": grupo,
+                    "path": caminho,
+                    "reason": motivo_ignorar,
+                })
+            log(f"XML ignorado por devolucao: {nome}")
+            if debug_log:
+                debug_log(f"[XML] Ignorado (devolucao): {caminho} | {motivo_ignorar}")
+            cache[cache_key] = agora
+            continue
         pagamento = _resumo_pagamento_xml(texto)
         destino_dir = criar_pasta_data(destino_base)
         log(f"XML movendo para: {destino_dir}")
@@ -2369,6 +2589,27 @@ def processar_pdfs(downloads_dir: Path, destino_mva: Path, destino_horizonte: Pa
                 debug_log(f"[PDF] Ignorado (identificado como boleto): {caminho}")
             cache[cache_key] = agora
             continue
+        grupo_pdf = ""
+        if texto and texto_mva and texto_mva.lower() in texto.lower():
+            grupo_pdf = "MVA"
+        elif texto and texto_horizonte and texto_horizonte.lower() in texto.lower():
+            grupo_pdf = "HORIZONTE"
+        ignorar_pdf, motivo_ignorar = _pdf_deve_ser_ignorado(texto)
+        if ignorar_pdf:
+            nf_pdf = _extrair_nf_do_nome(nome) or _extrair_dados_nf(texto or "")[0]
+            if nf_pdf:
+                movidos_info.append({
+                    "tipo": "ignorada",
+                    "nf": nf_pdf,
+                    "grupo": grupo_pdf,
+                    "path": caminho,
+                    "reason": motivo_ignorar,
+                })
+            log(f"PDF ignorado por devolucao: {nome}")
+            if debug_log:
+                debug_log(f"[PDF] Ignorado (devolucao): {caminho} | {motivo_ignorar}")
+            cache[cache_key] = agora
+            continue
         if (texto_mva or texto_horizonte) and not texto:
             if debug_log:
                 debug_log(f"[PDF] Ignorado (sem texto PDF): {caminho}")
@@ -2424,6 +2665,7 @@ def processar_boletos(
     cnpj_mva: str,
     cnpj_horizonte: str,
     cache: dict,
+    ignored_nfs: set[str] | None = None,
     workspace_dir: Path | None = None,
     log=print,
     debug_log=None,
@@ -2446,6 +2688,7 @@ def processar_boletos(
     agora = time.time()
     texto_mva = os.getenv("BOLETO_TEXT_MATCH_MVA", "MVA").strip().lower()
     texto_horizonte = os.getenv("BOLETO_TEXT_MATCH_HORIZONTE", "HORIZONTE").strip().lower()
+    ignored_nfs = {str(nf).strip() for nf in (ignored_nfs or set()) if str(nf).strip()}
 
     for idx, nome in enumerate(candidatos, start=1):
         caminho = downloads_dir / nome
@@ -2477,6 +2720,13 @@ def processar_boletos(
             continue
 
         info_boleto = _extrair_info_boleto_pdf(caminho, log=log, texto=texto)
+        nf_boleto = (info_boleto.get("nf") or _extrair_nf_do_nome(caminho.name) or "").strip()
+        if nf_boleto and nf_boleto in ignored_nfs:
+            log(f"BOLETO ignorado por NF de devolucao: {caminho.name}")
+            if debug_log:
+                debug_log(f"[BOLETO] Ignorado (NF devolucao): {caminho} | NF{nf_boleto}")
+            cache[cache_key] = agora
+            continue
         pagador = (info_boleto.get("pagador") or "").strip()
         beneficiario = (info_boleto.get("beneficiario") or "").strip()
         erros_extracao = []
@@ -2547,7 +2797,9 @@ def _tentar_criar_rascunhos(
     for nf, bucket in list(estado_nf.items()):
         if nf in nfs_enviadas and nf not in nfs_rascunho:
             continue
-        if _tipos_necessarios_bucket(bucket).issubset(set(bucket.keys())):
+        if not _bucket_gera_rascunho_automatico(bucket):
+            continue
+        if {"pdf", "xml", "boleto"}.issubset(set(bucket.keys())):
             prontas[nf] = bucket
 
     if not prontas or not service:
@@ -2657,6 +2909,51 @@ def _coletar_eventos_existentes_mes_atual(
 ) -> list[dict]:
     eventos = []
     current_keys: set[str] = set()
+    xmls_vistos: set[str] = set()
+    ignored_nfs: dict[str, str] = {}
+
+    xmls = []
+    for idx_base, base in enumerate(destinos_xml):
+        grupo = "HORIZONTE" if idx_base == 1 else "MVA"
+        pasta = _pasta_destino_mes_atual(base)
+        if not pasta.exists():
+            continue
+        # XMLs arquivados so entram pelo mes atual.
+        xmls.extend([(grupo, p) for p in pasta.rglob("*.xml") if p.is_file()])
+    xmls = _filtrar_arquivos_existentes_relevantes(xmls, seen_files=seen_files, only_new=only_new)
+    current_keys.update(key for _, _, key, _ in xmls)
+    for idx, (grupo, p, key, assinatura) in enumerate(xmls, start=1):
+        if status_cb:
+            status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
+        txt = _ler_texto_arquivo(p) or ""
+        nf = _extrair_nf_do_nome(p.name)
+        if not nf:
+            nf = _extrair_nf_xml_texto(txt)
+        ignorar_xml, motivo_ignorar = _xml_deve_ser_ignorado(txt)
+        if nf:
+            if ignorar_xml:
+                ignored_nfs[nf] = motivo_ignorar
+                eventos.append({
+                    "tipo": "ignorada",
+                    "path": p,
+                    "nf": nf,
+                    "grupo": grupo,
+                    "reason": motivo_ignorar,
+                })
+            else:
+                xmls_vistos.add(nf)
+        pagamento = _resumo_pagamento_xml(txt)
+        if nf and not ignorar_xml:
+            eventos.append({
+                "tipo": "xml",
+                "path": p,
+                "nf": nf,
+                "grupo": grupo,
+                "boleto_required": bool(pagamento.get("boleto_required", True)),
+                "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
+            })
+        if seen_files is not None and assinatura:
+            seen_files[key] = assinatura
 
     pdfs = []
     for idx_base, base in enumerate(destinos_pdf):
@@ -2672,6 +2969,29 @@ def _coletar_eventos_existentes_mes_atual(
         if status_cb:
             status_cb("PDF arquivado", p, idx, len(pdfs), "Lendo PDF arquivado")
         nf = _extrair_nf_do_nome(p.name)
+        if nf and nf in ignored_nfs:
+            if seen_files is not None and assinatura:
+                seen_files[key] = assinatura
+            continue
+        if not (nf and nf in xmls_vistos):
+            texto_pdf = _extrair_texto_pdf(p, log=log)
+            ignorar_pdf, motivo_ignorar = _pdf_deve_ser_ignorado(texto_pdf)
+            if ignorar_pdf:
+                nf_pdf = nf or _extrair_dados_nf(texto_pdf or "")[0]
+                if nf_pdf:
+                    ignored_nfs[nf_pdf] = motivo_ignorar
+                    eventos.append({
+                        "tipo": "ignorada",
+                        "path": p,
+                        "nf": nf_pdf,
+                        "grupo": grupo,
+                        "reason": motivo_ignorar,
+                    })
+                if seen_files is not None and assinatura:
+                    seen_files[key] = assinatura
+                continue
+            if not nf:
+                nf = _extrair_dados_nf(texto_pdf or "")[0]
         if nf:
             eventos.append({"tipo": "pdf", "path": p, "nf": nf, "grupo": grupo})
         if seen_files is not None and assinatura:
@@ -2694,40 +3014,11 @@ def _coletar_eventos_existentes_mes_atual(
         if not nf:
             info = _extrair_info_boleto_pdf(p, log=log)
             nf = (info.get("nf") or "").strip() or None
-        if nf:
+        if nf and nf not in ignored_nfs:
             eventos.append({"tipo": "boleto", "path": p, "nf": nf, "grupo": grupo})
         if seen_files is not None and assinatura:
             seen_files[key] = assinatura
 
-    xmls = []
-    for idx_base, base in enumerate(destinos_xml):
-        grupo = "HORIZONTE" if idx_base == 1 else "MVA"
-        pasta = _pasta_destino_mes_atual(base)
-        if not pasta.exists():
-            continue
-        # XMLs arquivados so entram pelo mes atual.
-        xmls.extend([(grupo, p) for p in pasta.rglob("*.xml") if p.is_file()])
-    xmls = _filtrar_arquivos_existentes_relevantes(xmls, seen_files=seen_files, only_new=only_new)
-    current_keys.update(key for _, _, key, _ in xmls)
-    for idx, (grupo, p, key, assinatura) in enumerate(xmls, start=1):
-        if status_cb:
-            status_cb("XML arquivado", p, idx, len(xmls), "Lendo XML arquivado")
-        txt = _ler_texto_arquivo(p) or ""
-        nf = _extrair_nf_do_nome(p.name)
-        if not nf:
-            nf = _extrair_nf_xml_texto(txt)
-        pagamento = _resumo_pagamento_xml(txt)
-        if nf:
-            eventos.append({
-                "tipo": "xml",
-                "path": p,
-                "nf": nf,
-                "grupo": grupo,
-                "boleto_required": bool(pagamento.get("boleto_required", True)),
-                "payment_label": "NF a vista" if pagamento.get("a_vista") else "",
-            })
-        if seen_files is not None and assinatura:
-            seen_files[key] = assinatura
     if seen_files is not None and not only_new:
         for key in list(seen_files):
             if key not in current_keys:
@@ -2741,7 +3032,9 @@ def _tem_nf_pronta_para_gmail(
     nfs_enviadas: set[str],
 ) -> bool:
     for nf, bucket in estado_nf.items():
-        if not {"pdf", "xml", "boleto"}.issubset(bucket.keys()):
+        if not _bucket_gera_rascunho_automatico(bucket):
+            continue
+        if not {"pdf", "xml", "boleto"}.issubset(set(bucket.keys())):
             continue
         if nf not in nfs_enviadas or nf in nfs_rascunho:
             return True
@@ -4752,7 +5045,7 @@ def _run_loop(stop_event: threading.Event, log):
                 last_gmail_retry = time.time()
                 gmail_service = _gmail_service(base_dir, log=log)
                 if gmail_service:
-                    log("Integração Gmail pronta. Rascunhos serão criados quando houver XML+PDF+BOLETO, ou apenas XML+PDF para NF a vista.")
+                    log("Integração Gmail pronta. Rascunhos serão criados quando houver XML+PDF+BOLETO.")
                 else:
                     log("Gmail indisponível no momento. O monitoramento de arquivos seguirá normalmente.")
             if not email_ativo_novo:
@@ -4855,6 +5148,7 @@ def _run_loop(stop_event: threading.Event, log):
             current_dir=str(origem_boleto),
         )
         if origem_boleto.exists():
+            ignored_nfs = set(_nfs_ignoradas_por_eventos(eventos))
             eventos.extend(
                 processar_boletos(
                     origem_boleto,
@@ -4863,6 +5157,7 @@ def _run_loop(stop_event: threading.Event, log):
                     cnpj_mva,
                     cnpj_horizonte,
                     cache,
+                    ignored_nfs=ignored_nfs,
                     workspace_dir=base_dir,
                     log=log,
                     debug_log=debug_log,
@@ -4968,6 +5263,36 @@ def _run_loop(stop_event: threading.Event, log):
                 last_gmail_pending_attempt = 0.0
 
         _atualizar_estado_nf_por_eventos(estado_nf, eventos)
+        ignored_nfs = _nfs_ignoradas_por_eventos(eventos)
+        houve_limpeza_ignoradas, gmail_ignoradas_ok = _conciliar_nfs_ignoradas(
+            base_dir,
+            ignored_nfs,
+            estado_nf,
+            nfs_rascunho,
+            report_state,
+            log=log,
+            gmail_service=gmail_service,
+        )
+        if houve_limpeza_ignoradas:
+            _salvar_report_state(base_dir, report_state, log=log)
+        if email_ativo_novo and not gmail_ignoradas_ok:
+            gmail_service = None
+            last_gmail_retry = 0.0
+            last_gmail_pending_attempt = 0.0
+        houve_limpeza_bloqueados, gmail_bloqueados_ok = _conciliar_rascunhos_bloqueados(
+            base_dir,
+            estado_nf,
+            nfs_rascunho,
+            report_state,
+            log=log,
+            gmail_service=gmail_service,
+        )
+        if houve_limpeza_bloqueados:
+            _salvar_report_state(base_dir, report_state, log=log)
+        if email_ativo_novo and not gmail_bloqueados_ok:
+            gmail_service = None
+            last_gmail_retry = 0.0
+            last_gmail_pending_attempt = 0.0
         if _sincronizar_pendencias_trio(base_dir, estado_nf, nfs_rascunho, nfs_enviadas, report_state, log=log):
             _salvar_report_state(base_dir, report_state, log=log)
 

@@ -19,7 +19,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 
 - A tela de configuração agora possui botão para autenticar ou reautenticar o Gmail manualmente, sem seleção manual de `credentials.json`.
 - Antes de criar rascunho, o Gmail agora é consultado pelo número da NF nos e-mails enviados; se já houver envio, a NF é marcada como enviada e rascunhos correspondentes são removidos.
-- NFs pagas à vista por indicador de pagamento imediato, cartão, PIX e outros meios sem boleto deixam de exigir boleto nas Pendências e passam a poder gerar rascunho só com `XML + PDF`, mesmo quando o XML traz `cobr/dup` preenchido pelo emissor.
+- NFs pagas à vista por indicador de pagamento imediato, cartão, PIX e outros meios sem boleto deixam de exigir boleto nas Pendências, mas não geram mais rascunho automático; o Gmail continua restrito a `PDF + XML + BOLETO`.
 - Rascunhos do Gmail sem assunto ou com mais de 5 dias no rascunho também são removidos pela limpeza automática.
 - A integração Gmail passa a tentar reconectar e reprocessar pendências automaticamente, sem depender de desligar e ligar o aplicativo.
 - A autenticação Gmail agora tenta abrir o navegador com fallback explícito e, se a abertura automática falhar, exibe e copia o link de autorização.
@@ -41,6 +41,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
 - A varredura de arquivos já arquivados passou a olhar somente as pastas do mês atual e, após a carga inicial, reler apenas itens novos ou alterados.
 - Pendências também são conciliadas com o Gmail enviado para evitar falso alerta em NF já enviada sem trio completo local.
+- NFs de devolução agora são ignoradas pelo XML e pelo PDF, deixam de entrar em `Pendências` e também saem do estado local de rascunhos/relatório herdado de versões anteriores.
 - A verificação de trio e de pendências agora considera apenas as 50 NFs numericamente mais altas de cada empresa, evitando alertas de semanas atrás.
 - Os logs principal e técnico são compactados automaticamente: linhas antigas são removidas e mensagens repetidas são filtradas.
 - Arquivos internos de estado agora são gravados com temporário único, retentativas e fallback para reduzir erro de `Acesso negado` no Windows quando há concorrência entre janelas/processos.
