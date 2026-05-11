@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -1389,6 +1389,20 @@ def _nome_xml_por_id(texto: str | None, fallback_nome: str) -> str:
 _TPAG_A_VISTA_FALLBACK = {
     "01", "02", "03", "04", "10", "11", "12", "13", "14", "16", "17", "18", "19",
 }
+_TPAG_SEM_BOLETO_EXPLICITO = {
+    "01", "02", "03", "04", "10", "11", "12", "13", "14", "16", "17", "18", "19", "20",
+}
+_XPAG_A_VISTA_MARKERS = (
+    "A VISTA",
+    "AVISTA",
+    "PIX",
+    "CARTAO",
+    "CARTÃO",
+    "DEBITO",
+    "DÉBITO",
+    "CREDITO",
+    "CRÉDITO",
+)
 
 
 def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
@@ -1398,14 +1412,23 @@ def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
     x_pags = [valor.strip() for valor in re.findall(r"<xPag>\s*([^<]+?)\s*</xPag>", conteudo, re.IGNORECASE)]
     tem_cobr = bool(re.search(r"<cobr\b", conteudo, re.IGNORECASE))
     tem_dup = bool(re.search(r"<dup\b", conteudo, re.IGNORECASE))
+    tem_card = bool(re.search(r"<card\b", conteudo, re.IGNORECASE))
+
+    x_pags_upper = [valor.upper() for valor in x_pags]
+    t_pags_set = set(t_pags)
 
     a_vista = any(valor == "0" for valor in ind_pags)
-    if not a_vista and not ind_pags:
-        x_pags_upper = [valor.upper() for valor in x_pags]
-        if any("A VISTA" in valor for valor in x_pags_upper):
-            a_vista = True
-        elif t_pags and set(t_pags).issubset(_TPAG_A_VISTA_FALLBACK) and not tem_cobr and not tem_dup:
-            a_vista = True
+    if not a_vista and any(marcador in valor for valor in x_pags_upper for marcador in _XPAG_A_VISTA_MARKERS):
+        a_vista = True
+    if not a_vista and tem_card:
+        a_vista = True
+    if not a_vista and t_pags_set and t_pags_set.issubset(_TPAG_SEM_BOLETO_EXPLICITO):
+        a_vista = True
+    if not a_vista and not ind_pags and t_pags and set(t_pags).issubset(_TPAG_A_VISTA_FALLBACK) and not tem_cobr and not tem_dup:
+        a_vista = True
+
+    if "15" in t_pags_set or any("BOLETO" in valor for valor in x_pags_upper):
+        a_vista = False
 
     return {
         "a_vista": a_vista,
@@ -1415,6 +1438,7 @@ def _resumo_pagamento_xml(texto: str | None) -> dict[str, object]:
         "x_pags": x_pags,
         "tem_cobr": tem_cobr,
         "tem_dup": tem_dup,
+        "tem_card": tem_card,
     }
 
 
