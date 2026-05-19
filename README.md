@@ -35,11 +35,14 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
   - detalhe do que está sendo analisado
   - duração do último ciclo
   - intervalo até a próxima varredura
-  - contagem de eventos `PDF/XML/BOLETO`
+  - contagem de eventos `XML/BOLETO/PDF`
+  - botão `Reiniciar` para limpar o estado interno do monitor e iniciar um novo ciclo
 - A janela de logs possui busca compacta sobreposta individualmente em `Log principal` e `Log técnico`, com destaque funcional e navegação por `Enter`, próximo e anterior.
 - A tela de `Configurar pastas` agora pode ser redimensionada e usa rolagem quando a altura da tela não comporta todos os campos.
 - Apenas os dois caminhos legados exatos de MVA que saíram errados em versões anteriores, `Z:\CAIXA\PDF VENDAS 2026` e `Z:\CAIXA\XML VENDAS 2026`, são ajustados automaticamente para a estrutura real da rede quando necessário.
-- Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas; ao clicar nele, um menu mostra por NF quais itens `PDF/XML/BOLETO` ainda faltam e é atualizado a cada ciclo enquanto o usuário corrige os arquivos.
+- Quando houver Pendências, um botão de alerta vermelho pisca no canto superior direito das abas, permanece clicável durante todo o pisca e abre um menu com abas `TODOS`, `MVA` e `EH`.
+- O ciclo principal passou a seguir a ordem `XML -> BOLETO -> PDF -> rascunhos -> repouso`, e a barra só fica cheia durante o repouso real.
+- Durante o repouso, o monitor acompanha mudanças de nome, tamanho e data de modificação nas pastas observadas para antecipar o próximo ciclo quando novos arquivos aparecem.
 - A varredura de arquivos já arquivados passou a olhar somente as pastas do mês atual e, após a carga inicial, reler apenas itens novos ou alterados.
 - Pendências também são conciliadas com o Gmail enviado para evitar falso alerta em NF já enviada sem trio completo local.
 - NFs de devolução agora são ignoradas pelo XML e pelo PDF, deixam de entrar em `Pendências` e também saem do estado local de rascunhos/relatório herdado de versões anteriores.
@@ -53,12 +56,13 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 O loop principal faz isto:
 
 1. Lê a configuração atual.
-2. Analisa a pasta de PDFs.
-3. Analisa a pasta de XMLs.
-4. Analisa a pasta de boletos.
-5. Tenta montar trios por NF para criar rascunhos.
-6. Reprocessa pendências de Gmail e remove rascunhos de NFs já enviadas.
-7. Aguarda o próximo ciclo.
+2. Analisa XMLs novos na pasta de downloads.
+3. Analisa boletos novos na pasta de downloads.
+4. Analisa PDFs novos na pasta de downloads.
+5. Atualiza o histórico do mês atual quando necessário.
+6. Tenta montar trios por NF para criar rascunhos.
+7. Reprocessa pendências de Gmail e remove rascunhos de NFs já enviadas.
+8. Aguarda o próximo ciclo em repouso.
 
 Por padrão, o próximo ciclo começa após `2` segundos. Esse valor pode ser alterado em `Configurar pastas`, no campo `Repouso entre ciclos`. A variável de ambiente `PDF_POLL_INTERVAL` ainda pode sobrescrever esse valor quando definida.
 
