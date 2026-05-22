@@ -27,6 +27,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
 - Boletos do Banco do Brasil deixam de usar a carteira `001-9` como se fosse o número do boleto; o número real passa a ser extraído da coluna `Nosso Número`/linha do documento.
 - A revisão Beatrice de boletos também passa a oferecer a pasta observada de boletos quando ela contém arquivos `BOLETO NF*.pdf`, além das pastas de destino.
+- O relatório de e-mails e Pendências agora é compartilhado em `\\192.168.1.240\eh\beatrice`; somente o computador com `Criar rascunhos` ativado grava nesses arquivos, enquanto os demais apenas leem.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.
 - O fluxo de `BOLETO` deixou de poluir o log com PDFs que não são boleto.

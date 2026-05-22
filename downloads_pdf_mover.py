@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -148,13 +148,34 @@ def _debug_log_path(base_dir: Path) -> Path:
     appdata = Path(os.getenv("APPDATA", str(base_dir)))
     return Path(os.getenv("PDF_DEBUG_LOG_PATH", str(appdata / "PdfWatcher" / "logs" / "watcher_debug.log")))
 
+def _shared_beatrice_dir(base_dir: Path) -> Path:
+    return Path(os.getenv("PDF_SHARED_BEATRICE_DIR", r"\\192.168.1.240\eh\beatrice"))
+
 def _report_path(base_dir: Path) -> Path:
-    appdata = Path(os.getenv("APPDATA", str(base_dir)))
-    return Path(os.getenv("PDF_REPORT_PATH", str(appdata / "PdfWatcher" / "logs" / "report.txt")))
+    override = os.getenv("PDF_REPORT_PATH", "").strip()
+    if override:
+        return Path(override)
+    return _shared_beatrice_dir(base_dir) / "report.txt"
 
 def _report_state_path(base_dir: Path) -> Path:
+    override = os.getenv("PDF_REPORT_STATE_PATH", "").strip()
+    if override:
+        return Path(override)
+    return _shared_beatrice_dir(base_dir) / "report_state.json"
+
+def _report_write_allowed(base_dir: Path, log=print) -> bool:
+    if os.getenv("PDF_REPORT_READ_ONLY", "").strip() == "1":
+        return False
+    try:
+        cfg = _carregar_config(base_dir, log=lambda *a: None)
+        return (cfg.get("email_enabled", "0") or "").strip() == "1"
+    except Exception as e:
+        log(f"Falha ao validar permissao de escrita do relatorio: {e}")
+        return False
+
+def _legacy_report_state_path(base_dir: Path) -> Path:
     appdata = Path(os.getenv("APPDATA", str(base_dir)))
-    return Path(os.getenv("PDF_REPORT_STATE_PATH", str(appdata / "PdfWatcher" / "report_state.json")))
+    return appdata / "PdfWatcher" / "report_state.json"
 
 def _viewer_settings_path(base_dir: Path) -> Path:
     appdata = Path(os.getenv("APPDATA", str(base_dir)))
@@ -556,17 +577,25 @@ def _log(msg: str, log_path: Path):
 
 def _carregar_report_state(base_dir: Path, log=print) -> dict[str, str]:
     path = _report_state_path(base_dir)
-    if path.exists():
+    candidatos = [path]
+    legacy = _legacy_report_state_path(base_dir)
+    if legacy != path:
+        candidatos.append(legacy)
+    for candidato in candidatos:
+        if not candidato.exists():
+            continue
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(candidato.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 return {str(k): str(v) for k, v in raw.items()}
         except Exception as e:
-            log(f"Falha ao ler estado de relatório '{path}': {e}")
+            log(f"Falha ao ler estado de relatório '{candidato}': {e}")
     return {}
 
 
 def _salvar_report_state(base_dir: Path, state: dict[str, str], log=print) -> None:
+    if not _report_write_allowed(base_dir, log=log):
+        return
     path = _report_state_path(base_dir)
     try:
         ok, erro = _gravar_texto_resiliente(path, json.dumps(state, indent=2, ensure_ascii=False))
@@ -777,6 +806,8 @@ def _salvar_viewer_settings(base_dir: Path, settings: dict[str, bool], log=print
 
 
 def _registrar_relatorio(base_dir: Path, nf: str, status: str, motivo: str, log=print) -> None:
+    if not _report_write_allowed(base_dir, log=log):
+        return
     path = _report_path(base_dir)
     ts = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
     linha = f"[{ts}] NF{nf} | {status} | Motivo: {motivo}"
@@ -4540,6 +4571,7 @@ def _abrir_relatorio(base_dir: Path, log=print):
         return
 
     caminho = _report_path(base_dir)
+    pode_editar_relatorio = _report_write_allowed(base_dir, log=log)
     app = QApplication.instance()
     created_app = False
     if app is None:
@@ -4577,6 +4609,7 @@ def _abrir_relatorio(base_dir: Path, log=print):
     subtitle = QLabel(
         "Este relatório mostra o status dos e-mails e o motivo de cada decisão.\n"
         "Legenda: RASCUNHO CRIADO, JÁ ENVIADO, PENDENTE, FALHA AO CRIAR RASCUNHO.\n"
+        f"Modo: {'leitura e escrita' if pode_editar_relatorio else 'somente leitura'}.\n"
         f"Arquivo: {caminho}"
     )
     subtitle.setObjectName("subtitle")
@@ -4589,8 +4622,9 @@ def _abrir_relatorio(base_dir: Path, log=print):
 
     actions = QHBoxLayout()
     btn_refresh = QPushButton("Atualizar")
-    btn_open = QPushButton("Abrir arquivo")
+    btn_open = QPushButton("Abrir arquivo" if pode_editar_relatorio else "Arquivo somente leitura")
     btn_open.setProperty("class", "secondary")
+    btn_open.setEnabled(pode_editar_relatorio)
     btn_close = QPushButton("Fechar")
     btn_close.setProperty("class", "secondary")
     actions.addWidget(btn_refresh)
@@ -4620,10 +4654,15 @@ def _abrir_relatorio(base_dir: Path, log=print):
         try:
             if caminho.exists():
                 os.startfile(str(caminho))
-            else:
+            elif _report_write_allowed(base_dir, log=log):
                 caminho.parent.mkdir(parents=True, exist_ok=True)
                 caminho.write_text("", encoding="utf-8")
                 os.startfile(str(caminho))
+            else:
+                text.setPlainText(
+                    "O relatório compartilhado ainda não foi criado.\n"
+                    "Somente o computador com 'Criar rascunhos' ativado pode criar ou editar esse arquivo."
+                )
         except Exception as e:
             log(f"Falha ao abrir arquivo de relatório: {e}")
 
@@ -4654,6 +4693,10 @@ def _garantir_arquivos_iniciais(base_dir: Path, log=print) -> bool:
         p_log = _log_path(base_dir)
         p_log.parent.mkdir(parents=True, exist_ok=True)
         p_log.touch(exist_ok=True)
+        try:
+            _shared_beatrice_dir(base_dir).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            log(f"Falha ao preparar pasta compartilhada da Beatrice: {e}")
         if not _status_path(base_dir).exists():
             _salvar_status(base_dir, _status_padrao(), log=log)
     except Exception as e:
