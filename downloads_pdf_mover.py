@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
@@ -946,7 +946,18 @@ def _nome_boleto_parece_invalido(nome: str | None) -> bool:
     if not n:
         return True
     u = n.upper()
+    compacto = _texto_compacto(n)
     if _linha_digitavel_boleto(n):
+        return True
+    if "agencia" in compacto and "codigo" in compacto:
+        return True
+    if "valor" in compacto and ("documento" in compacto or "pago" in compacto or "cobrado" in compacto):
+        return True
+    if "cpf" in compacto and "cnpj" in compacto:
+        return True
+    if "bene" in compacto and "ciario" in compacto and any(
+        marcador in compacto for marcador in ("nome", "cnpj", "final", "nosso", "agencia", "codigo")
+    ):
         return True
     if re.search(r"https?://|AUTOATENDIMENTO|\.BB\.COM\.BR", u):
         return True
@@ -1039,7 +1050,7 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     if not nosso_numero_sicoob:
         linhas_texto = [ln.strip() for ln in texto.splitlines()]
         for ln in linhas_texto:
-            m_nn_isolado = re.fullmatch(r"(\d{3,8})-(\d{1,2})", ln.strip())
+            m_nn_isolado = re.fullmatch(r"(\d{4,8})-(\d{1,2})", ln.strip())
             if m_nn_isolado:
                 nosso_numero_sicoob = ln.strip()
                 break
@@ -5730,7 +5741,7 @@ def _listar_pastas_review_boleto(base_dir: Path, log=print) -> list[dict[str, ob
     cfg = _carregar_config(base_dir, log=lambda *a: None)
     roots: list[tuple[str, Path]] = []
 
-    for label, key in (("MVA", "boleto_destino_mva"), ("HORIZONTE", "boleto_destino_horizonte")):
+    for label, key in (("MVA", "boleto_destino_mva"), ("HORIZONTE", "boleto_destino_horizonte"), ("OBSERVADA", "boleto_watch_dir")):
         raw = (cfg.get(key) or "").strip()
         if raw:
             roots.append((label, Path(raw)))
