@@ -31,8 +31,9 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
+DEFAULT_SHARED_BEATRICE_DIR = r"\\srv-mva\EH\Pasta Compartilhada Financeiro"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
 _AUTO_CFG_FIX_LOGGED: set[str] = set()
 RECENT_NF_LIMIT_PER_GROUP = 50
@@ -63,6 +64,7 @@ def _default_paths(base_dir: Path) -> dict[str, str]:
         "auto_update_enabled": "1",
         "scan_interval_seconds": "2",
         "log_retention_days": "14",
+        "shared_beatrice_dir": DEFAULT_SHARED_BEATRICE_DIR,
     }
 
 
@@ -149,7 +151,17 @@ def _debug_log_path(base_dir: Path) -> Path:
     return Path(os.getenv("PDF_DEBUG_LOG_PATH", str(appdata / "PdfWatcher" / "logs" / "watcher_debug.log")))
 
 def _shared_beatrice_dir(base_dir: Path) -> Path:
-    return Path(os.getenv("PDF_SHARED_BEATRICE_DIR", r"\\192.168.1.240\eh\beatrice"))
+    override = os.getenv("PDF_SHARED_BEATRICE_DIR", "").strip()
+    if override:
+        return Path(override)
+    try:
+        cfg = _carregar_config(base_dir, log=lambda *a: None)
+        configured = str(cfg.get("shared_beatrice_dir") or "").strip()
+        if configured:
+            return Path(configured)
+    except Exception:
+        pass
+    return Path(DEFAULT_SHARED_BEATRICE_DIR)
 
 def _report_path(base_dir: Path) -> Path:
     override = os.getenv("PDF_REPORT_PATH", "").strip()
@@ -446,6 +458,7 @@ def _carregar_config(base_dir: Path, log=print) -> dict[str, str]:
         "xml_destino_horizonte": "XML_DESTINO_DIR_HORIZONTE",
         "boleto_destino_mva": "BOLETO_DESTINO_DIR_MVA",
         "boleto_destino_horizonte": "BOLETO_DESTINO_DIR_HORIZONTE",
+        "shared_beatrice_dir": "PDF_SHARED_BEATRICE_DIR",
         "email_enabled": "EMAIL_DRAFT_ENABLED",
         "debug_enabled": "DEBUG_LOG_ENABLED",
         "auto_update_enabled": "AUTO_UPDATE_ENABLED",
@@ -3259,6 +3272,7 @@ def _abrir_interface_config(base_dir: Path, log=print):
         ("Destino XML HORIZONTE", "xml_destino_horizonte"),
         ("Destino BOLETO MVA", "boleto_destino_mva"),
         ("Destino BOLETO HORIZONTE", "boleto_destino_horizonte"),
+        ("Relatório compartilhado Beatrice", "shared_beatrice_dir"),
     ]
 
     app = QApplication.instance()
