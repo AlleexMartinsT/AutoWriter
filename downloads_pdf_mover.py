@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 DEFAULT_SHARED_BEATRICE_DIR = r"\\srv-mva\EH\Pasta Compartilhada Financeiro"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
@@ -2197,19 +2197,16 @@ def _criar_rascunho_gmail(service, assunto: str, corpo: str, anexos: list[Path],
         return None
 
 
-def _termos_busca_nf_gmail(nf: str, incluir_numero_solto: bool = True) -> list[str]:
+def _termos_busca_nf_gmail(nf: str) -> list[str]:
     nf = (nf or "").strip()
     if not nf:
         return []
     termos = [
+        f'subject:"XML PDF NF{nf}"',
         f'subject:"XML PDF NF{nf} + BOLETO"',
-        f'subject:"NF{nf}"',
-        f'subject:"NF {nf}"',
-        f'"NF{nf}"',
-        f'"NF {nf}"',
+        f'subject:"XML PDF NF {nf}"',
+        f'subject:"XML PDF NF {nf} + BOLETO"',
     ]
-    if incluir_numero_solto:
-        termos.append(f'"{nf}"')
     vistos = set()
     unicos = []
     for termo in termos:
@@ -2221,7 +2218,7 @@ def _termos_busca_nf_gmail(nf: str, incluir_numero_solto: bool = True) -> list[s
 
 
 def _nf_enviada_gmail(service, nf: str, log=print) -> bool | None:
-    for termo in _termos_busca_nf_gmail(nf, incluir_numero_solto=True):
+    for termo in _termos_busca_nf_gmail(nf):
         q = f"in:sent {termo}"
         try:
             resp = service.users().messages().list(userId="me", q=q, maxResults=1).execute()
@@ -2235,7 +2232,7 @@ def _nf_enviada_gmail(service, nf: str, log=print) -> bool | None:
 
 def _excluir_rascunhos_gmail(service, nf: str, log=print) -> tuple[int, bool]:
     draft_ids: set[str] = set()
-    for q in _termos_busca_nf_gmail(nf, incluir_numero_solto=False):
+    for q in _termos_busca_nf_gmail(nf):
         page_token = None
         paginas = 0
         while paginas < 5:

@@ -19,6 +19,7 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 
 - A tela de configuração agora possui botão para autenticar ou reautenticar o Gmail manualmente, sem seleção manual de `credentials.json`.
 - Antes de criar rascunho, o Gmail agora é consultado pelo número da NF nos e-mails enviados; se já houver envio, a NF é marcada como enviada e rascunhos correspondentes são removidos.
+- A consulta de enviados no Gmail agora fica restrita aos assuntos gerados pela Beatrice (`XML PDF NF...`), evitando falso positivo por numero solto no corpo de outros e-mails.
 - NFs pagas à vista por indicador de pagamento imediato, cartão, PIX e outros meios sem boleto deixam de exigir boleto nas Pendências, mas não geram mais rascunho automático; o Gmail continua restrito a `PDF + XML + BOLETO`.
 - A detecção de NF `à vista` também considera a própria natureza da operação do XML quando o emissor envia combinações incompletas de pagamento, como `tPag=05`, `tPag=90` ou `<pag></pag>`, sem confundir notas marcadas como `a prazo`.
 - Rascunhos do Gmail sem assunto ou com mais de 5 dias no rascunho também são removidos pela limpeza automática.
