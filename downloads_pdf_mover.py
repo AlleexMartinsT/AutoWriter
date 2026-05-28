@@ -31,7 +31,7 @@ MESES = [
 APP_NAME = "PdfWatcher"
 CONFIG_FILE_NAME = "config.json"
 NFES_PACOTE_RE = re.compile(r"nfes\s*-\s*\d+\s*-\s*\d+", re.IGNORECASE)
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 GITHUB_REPO = "AlleexMartinsT/AutoWriter"
 DEFAULT_SHARED_BEATRICE_DIR = r"\\srv-mva\EH\Pasta Compartilhada Financeiro"
 _STATE_WRITE_ERROR_LOG_AT: dict[str, float] = {}
@@ -1080,15 +1080,26 @@ def _extrair_info_boleto_pdf(caminho: Path, log=print, texto: str | None = None)
     nf = None
     nosso_numero_sicoob = None
 
+    def _formatar_nosso_sicoob(valor: str | None) -> str | None:
+        valor = (valor or "").strip()
+        if not valor:
+            return None
+        if "-" in valor:
+            return valor
+        digitos = re.sub(r"\D", "", valor)
+        if 4 <= len(digitos) <= 8:
+            return f"{digitos[:-1]}-{digitos[-1]}"
+        return valor
+
     # I check the Sicoob summary line: "NRDOC DM N DD/MM/YYYY NOSSO_NUMERO"
     # N. documento (e.g. 0020776-01) is the NF; the trailing XXXX-D is the Nosso Número
     m_sicoob = re.search(
-        r"\b0*([1-9]\d{0,11})(?:-\d{1,2})?\s+(?:DM|DS|NP|DMI|OU)\s+(?:[SN]|[A-Z]{3}|SIM|NAO|N\xc3\x83O)?\s*\d{2}/\d{2}/\d{4}\s+(\d{3,8}-\d{1,2})\b",
+        r"\b0*([1-9]\d{0,11})(?:-\d{1,2})?\s+(?:DM|DS|NP|DMI|OU)\s+(?:[A-Z]{1,3}|SIM|NAO)?\s*\d{2}/\d{2}/\d{4}\s+(\d{3,12}(?:-\d{1,2})?)\b",
         texto_numeros, re.IGNORECASE
     )
     if m_sicoob:
         nf = m_sicoob.group(1).lstrip("0") or m_sicoob.group(1)
-        nosso_numero_sicoob = m_sicoob.group(2)
+        nosso_numero_sicoob = _formatar_nosso_sicoob(m_sicoob.group(2))
 
     # I also look for an isolated "XXXX-D" line as Nosso Número fallback (when summary line absent)
     if not nosso_numero_sicoob:
@@ -2859,7 +2870,10 @@ def processar_boletos(
             continue
 
         info_boleto = _extrair_info_boleto_pdf(caminho, log=log, texto=texto)
-        nf_boleto = (info_boleto.get("nf") or _extrair_nf_do_nome(caminho.name) or "").strip()
+        nf_fallback = (_extrair_nf_do_nome(caminho.name) or "").strip()
+        if not (info_boleto.get("nf") or "").strip() and nf_fallback:
+            info_boleto["nf"] = nf_fallback
+        nf_boleto = (info_boleto.get("nf") or "").strip()
         if nf_boleto and nf_boleto in ignored_nfs:
             log(f"BOLETO ignorado por NF de devolucao: {caminho.name}")
             if debug_log:
@@ -2869,6 +2883,8 @@ def processar_boletos(
         pagador = (info_boleto.get("pagador") or "").strip()
         beneficiario = (info_boleto.get("beneficiario") or "").strip()
         erros_extracao = []
+        if not nf_boleto:
+            erros_extracao.append("nf_vazia")
         if not pagador:
             erros_extracao.append("pagador_vazio")
         elif _nome_boleto_parece_invalido(pagador):
@@ -5723,10 +5739,18 @@ def _review_duplicates_dir(base_dir: Path) -> Path:
     return Path(os.getenv("PDF_REVIEW_DUPLICATES_PATH", str(appdata / "PdfWatcher" / "review_duplicates")))
 
 
+def _eh_boleto_review_candidate(pdf_file: Path) -> bool:
+    return (
+        pdf_file.is_file()
+        and pdf_file.suffix.lower() == ".pdf"
+        and _normalizar_nome_arquivo(pdf_file.name).upper().startswith("BOLETO")
+    )
+
+
 def _listar_boletos_review(target_folder: Path) -> list[Path]:
     return sorted(
         p for p in target_folder.rglob("*.pdf")
-        if p.is_file() and p.name.upper().startswith("BOLETO NF")
+        if _eh_boleto_review_candidate(p)
     )
 
 
@@ -5735,6 +5759,9 @@ def _coletar_duplicatas_review(target_folder: Path) -> list[tuple[Path, Path]]:
     for pdf_file in _listar_boletos_review(target_folder):
         texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
         info = _extrair_info_boleto_pdf(pdf_file, log=lambda *a: None, texto=texto)
+        nf_fallback = (_extrair_nf_do_nome(pdf_file.name) or "").strip()
+        if not (info.get("nf") or "").strip() and nf_fallback:
+            info["nf"] = nf_fallback
         if not info.get("nosso_numero"):
             continue
         novo_nome = _nomear_boleto(info, pdf_file.name)
@@ -5800,7 +5827,7 @@ def _listar_pastas_review_boleto(base_dir: Path, log=print) -> list[dict[str, ob
         if raw:
             roots.append((label, Path(raw)))
 
-    if any(p.is_file() and p.name.upper().startswith("BOLETO NF") for p in base_dir.glob("*.pdf")):
+    if any(_eh_boleto_review_candidate(p) for p in base_dir.glob("*.pdf")):
         roots.append(("WORKSPACE", base_dir))
 
     entries = []
@@ -5812,7 +5839,7 @@ def _listar_pastas_review_boleto(base_dir: Path, log=print) -> list[dict[str, ob
 
         boleto_files = [
             p for p in root.rglob("*.pdf")
-            if p.is_file() and p.name.upper().startswith("BOLETO NF")
+            if _eh_boleto_review_candidate(p)
         ]
         if not boleto_files:
             continue
@@ -5998,7 +6025,7 @@ def _abrir_review(base_dir: Path, log=print):
             self._log(f"Boletos encontrados: {len(arquivos)}")
 
             if not arquivos:
-                self._log("Nenhum boleto com prefixo 'BOLETO NF' foi encontrado nesta pasta.")
+                self._log("Nenhum boleto com prefixo 'BOLETO' foi encontrado nesta pasta.")
                 self.finished_signal.emit()
                 return
 
@@ -6020,7 +6047,15 @@ def _abrir_review(base_dir: Path, log=print):
 
                 texto = _extrair_texto_pdf(pdf_file, log=lambda *a: None)
                 info = _extrair_info_boleto_pdf(pdf_file, log=lambda *a: None, texto=texto)
+                nf_fallback = (_extrair_nf_do_nome(pdf_file.name) or "").strip()
+                if not (info.get("nf") or "").strip() and nf_fallback:
+                    info["nf"] = nf_fallback
                 novo_nome = _nomear_boleto(info, pdf_file.name)
+
+                if not info.get("nf"):
+                    avisos += 1
+                    self._log(f"AVISO: NF não identificada em {pdf_file.name}")
+                    continue
 
                 if not info.get("nosso_numero"):
                     avisos += 1

@@ -26,8 +26,10 @@ Aplicativo desktop para Windows que monitora pastas de PDF, XML e boleto, move o
 - A integração Gmail passa a tentar reconectar e reprocessar pendências automaticamente, sem depender de desligar e ligar o aplicativo.
 - A autenticação Gmail agora tenta abrir o navegador com fallback explícito e, se a abertura automática falhar, exibe e copia o link de autorização.
 - Adicionada leitura direta de "nosso número" para boletos vindos do Sicoob ou ZWeb por reconhecimento da assinatura do arquivo CNPJ-BOLETO-ID.pdf.
+- Boletos Sicoob cujo resumo traz `N. documento` com NF e `Nosso número` sem hífen agora são renomeados corretamente em vez de permanecerem como `boleto (X).pdf`.
 - Boletos do Banco do Brasil deixam de usar a carteira `001-9` como se fosse o número do boleto; o número real passa a ser extraído da coluna `Nosso Número`/linha do documento.
-- A revisão Beatrice de boletos também passa a oferecer a pasta observada de boletos quando ela contém arquivos `BOLETO NF*.pdf`, além das pastas de destino.
+- A revisão Beatrice de boletos também passa a oferecer a pasta observada de boletos quando ela contém arquivos `BOLETO*.pdf`, além das pastas de destino.
+- A revisão Beatrice de boletos agora também corrige arquivos `BOLETO...pdf` sem `NF` no nome, incluindo casos como `boleto (3).pdf`.
 - O relatório de e-mails e Pendências agora é compartilhado em `\\srv-mva\EH\Pasta Compartilhada Financeiro` por padrão, com caminho editável em `Configurar pastas`; somente o computador com `Criar rascunhos` ativado grava nesses arquivos, enquanto os demais apenas leem.
 - Arquivos antigos não esperam mais vários segundos para serem considerados estáveis.
 - O fluxo de `PDF` deixou de tentar tratar boleto como PDF comum.
